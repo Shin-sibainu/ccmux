@@ -1,0 +1,13 @@
+[package]
+name = "ccmux"
+version = "0.1.0"
+edition = "2021"
+description = "Claude Code Multiplexer — manage multiple Claude Code instances in TUI panes"
+
+[dependencies]
+ratatui = "0.30"
+crossterm = "0.29"
+portable-pty = "0.8"
+vt100 = "0.16"
+anyhow = "1.0"
+unicode-width = "0.2"
