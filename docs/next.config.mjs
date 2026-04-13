@@ -6,5 +6,7 @@ const withNextra = nextra({
 })
 
 export default withNextra({
+  output: 'export',
   images: { unoptimized: true },
+  basePath: process.env.NODE_ENV === 'production' ? '/ccmux' : '',
 })
