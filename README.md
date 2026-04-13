@@ -124,6 +124,10 @@ src/
 - [vt100](https://crates.io/crates/vt100) — Terminal emulation
 - [syntect](https://github.com/trishume/syntect) — Syntax highlighting
 
+## Learn Claude Code
+
+New to Claude Code? Check out [Claude Code Academy](https://claude-code-academy.dev) for tutorials and guides.
+
 ## License
 
 MIT
