@@ -1,181 +1,121 @@
 ---
-title: 'portable-pty で Windows と Unix を同じコードで扱う'
-description: 'macOS は forkpty、Linux は openpty、Windows は ConPTY。全部違う API を portable-pty が呑み込んでくれる話。'
+title: 'Windows でも動く、のタネ明かし'
+description: 'ccmux は単一バイナリで Windows / macOS / Linux どれでも動く。でも「シェルを動かす仕組み」は OS ごとに全然違う。どう隠してるか。'
 pubDate: 2026-04-09
 tags: ['rust', 'pty', 'cross-platform']
 ---
 
-ccmux は単一バイナリで Windows / macOS / Linux のどれでも動きます。PTY を扱う以上は OS ごとに API が違うので、普通に書くと `#[cfg(...)]` だらけになりそうなものですが、実際はほとんど分岐なしで書けています。
+ccmux は、どの OS でも同じ 2MB のバイナリひとつ。Windows でも WSL なしで動きます。
 
-理由は [**portable-pty**](https://crates.io/crates/portable-pty) という抽象レイヤ。Wezterm の作者が作っている、Rust の PTY ライブラリです。
+でも実のところ、**シェルと会話する仕組みは OS ごとにてんで違う**んです。そのギャップを何で埋めているかという話。
 
-## PTY って何？
+## 「シェルに会話してもらう」とは
 
-「シェルに TTY だと錯覚させる」ための仕組みです。`bash` は標準入出力が TTY でないと:
+`bash` とか `zsh` は、相手が**人間のターミナル**じゃないと察すると挙動を変えます:
 
-- プロンプトを出さない
-- カラーを出力しない
-- 行バッファではなく全バッファに切り替わる（パイプ相手と同じ挙動）
+- プロンプト (`$ `) を出さなくなる
+- 色を省く
+- 行ごとの入出力を諦めて、全部まとめてしまう
 
-ということをします。ccmux のようなマルチプレクサは、親プロセスがシェルに対して**仮想ターミナル**を提供して、TTY として振る舞わせる必要があります。それが PTY。
+パイプ (`ls | grep foo`) にすると色が消えるの、経験ありませんか？ あれは bash が「相手はターミナルじゃなくてパイプだな」と気づいて、出力の見た目を変えているから。
 
-## 各 OS の実態
+ccmux のようなツールがシェルを内部で動かす時、シェルにそのことを気づかせずに**「いや、ちゃんとターミナルで動いてるよ」と信じさせる**必要があります。そのための仕組みが **PTY**（pseudo-terminal、擬似端末）。
+
+## OS ごとの実態
+
+PTY の実装は、OS ごとに別物です:
 
 | OS | 実装 |
 |---|---|
-| Linux | `openpty(3)` + `fork()` + `setsid()` |
-| macOS | 同上 |
-| Windows 10+ | ConPTY (`CreatePseudoConsole` API) |
+| Linux | `openpty()` + `fork()` + `setsid()` |
+| macOS | 同じような Unix 系 API |
+| Windows 10+ | ConPTY（`CreatePseudoConsole`） |
 
-Windows の ConPTY は 2018 年の Windows 10 1809 で追加された比較的新しい仕組みで、それ以前は WinPty というサードパーティ実装が必要でした。ConPTY のおかげで Windows でも tmux 的な物が書けるようになった経緯があります。
+ConPTY は 2018 年の Windows 10 1809 で追加された、比較的新しい仕組み。それ以前は WinPTY というサードパーティ実装が必要で、この出現が「Windows でも tmux 的なものが作れる」時代を開きました。
 
-## portable-pty の API
+## portable-pty が全部飲み込んでくれる
 
-どの OS でも**完全に同じ呼び出し**で済みます:
+Rust には [**portable-pty**](https://crates.io/crates/portable-pty) というクレートがあって、OS ごとの差を吸収してくれます。wezterm（Rust 製のターミナルエミュレータ）の作者が作ってるもので、完成度が高い。
+
+同じ API で、裏では OS ごとに違うものが動きます:
 
 ```rust title="src/pane.rs"
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
-use std::path::PathBuf;
 
-fn spawn_shell(rows: u16, cols: u16) -> anyhow::Result<PaneHandles> {
-    let pty = native_pty_system();
-
-    let pair = pty.openpty(PtySize {
-        rows,
-        cols,
-        pixel_width: 0,
-        pixel_height: 0,
-    })?;
+fn spawn_shell(rows: u16, cols: u16) -> anyhow::Result<...> {
+    let pty = native_pty_system(); // ← OS を自動判定
+    let pair = pty.openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })?;
 
     let shell = detect_shell();
     let mut cmd = CommandBuilder::new(&shell);
-
-    // ログインシェル相当で起動して PATH を含んだ環境を作る
-    if shell_name(&shell).contains("bash") || shell_name(&shell).contains("zsh") {
-        cmd.arg("--login");
-    }
-
-    cmd.cwd(std::env::current_dir()?);
     cmd.env("TERM", "xterm-256color");
-    cmd.env("CCMUX", "1"); // ネストした ccmux 起動検出用
+    cmd.env("CCMUX", "1"); // ← 後で説明
 
     let child = pair.slave.spawn_command(cmd)?;
-    drop(pair.slave); // slave は子プロセス側が持つので親では閉じる
+    drop(pair.slave); // slave は子プロセスが持つ。親では閉じる。
 
     let writer = pair.master.take_writer()?;
     let reader = pair.master.try_clone_reader()?;
 
-    Ok(PaneHandles { master: pair.master, writer, reader, child })
+    // ...
 }
 ```
 
-`#[cfg(windows)]` もなし。`native_pty_system()` が OS を判断して実装を切り替えてくれます。
+`#[cfg(windows)]` も `#[cfg(unix)]` も、一度も書いていません。これがクロスプラットフォームの気持ちよさ。
 
-## リサイズも同じ
+## どのシェルを起動するか
 
-ターミナルウィンドウをリサイズしたら、PTY 側も追従させる必要があります:
+ccmux は OS ごとにシェルの優先順位を変えます。
+
+**Windows:**
+
+1. Git Bash (`C:\Program Files\Git\bin\bash.exe`) を最優先
+2. PATH 上の `bash`
+3. 最終手段で PowerShell
+
+Windows で **Git Bash を優先している理由**は、Claude Code を含む多くの Unix 系 CLI が bash 前提に作られているから。PowerShell だと `ls -la` や `grep` がそのまま通らない場面が多くて不便です。
+
+**Unix系（macOS / Linux）:**
+
+1. `$SHELL` 環境変数（ユーザーの普段使いのシェル）
+2. 無ければ `/bin/sh`
+
+## シェルに「今どこにいるか」を聞く小ワザ
+
+シェルで `cd` しても、ccmux からはそのイベントが見えません。シェルは黙って自分の内部状態を変えるだけ。
+
+そこで**プロンプトが出るたびに、シェル自身から現在のパスを放送してもらう**ように仕込みます:
 
 ```rust
-fn resize(master: &mut Box<dyn MasterPty>, rows: u16, cols: u16) -> anyhow::Result<()> {
-    master.resize(PtySize {
-        rows,
-        cols,
-        pixel_width: 0,
-        pixel_height: 0,
-    })?;
-    Ok(())
-}
+let setup = " __ccmux_osc7() { \
+    printf '\\033]7;file://%s%s\\007' \"$HOSTNAME\" \"$PWD\"; \
+}; \
+PROMPT_COMMAND=\"__ccmux_osc7;${PROMPT_COMMAND}\"; \
+clear\n";
+writer.write_all(setup.as_bytes())?;
 ```
 
-Unix では `ioctl(TIOCSWINSZ)`、Windows では `ResizePseudoConsole` が呼ばれますが、使う側は意識しなくていい。
+`\033]7;file://...\007` は **OSC 7** という特殊なエスケープ。「今いるディレクトリはここ」とターミナルに伝える合言葉です。
 
-## シェル検出
+ccmux はこれを vt100 パーサで拾って、ペインごとの cwd を最新に保ちます。ファイルツリーや新しいペインの起動ディレクトリが、**自動で「今の場所」**に追従するのはこのおかげ。
 
-ccmux は OS ごとにシェルの検索順を変えます:
+> ちなみに、setup の先頭に **スペース** を入れているのは、bash の `HISTCONTROL=ignorespace` が効いてる環境で履歴を汚さないため。こういう細かい気遣いが効きます。
 
-```rust title="src/pane.rs — detect_shell()"
-pub fn detect_shell() -> PathBuf {
-    #[cfg(windows)]
-    { detect_shell_windows() }
-    #[cfg(not(windows))]
-    { detect_shell_unix() }
-}
+## ネストした起動を拒否する
 
-#[cfg(windows)]
-fn detect_shell_windows() -> PathBuf {
-    // 1. Git Bash を優先
-    for p in &[
-        r"C:\Program Files\Git\bin\bash.exe",
-        r"C:\Program Files (x86)\Git\bin\bash.exe",
-    ] {
-        let path = PathBuf::from(p);
-        if path.exists() { return path; }
-    }
+ccmux の中でさらに ccmux を起動したら、PTY の中で PTY が走ることになって入力が二重処理され、**キー入力が壊れて動かなくなります**。
 
-    // 2. PATH 上の bash
-    if let Ok(output) = std::process::Command::new("where").arg("bash").output() {
-        if output.status.success() {
-            let s = String::from_utf8_lossy(&output.stdout);
-            if let Some(line) = s.lines().next() {
-                let path = PathBuf::from(line.trim());
-                if path.exists() { return path; }
-            }
-        }
-    }
+これを防ぐため、子シェルに `CCMUX=1` という環境変数を仕込んでおいて、ccmux 自体が起動時にチェックします:
 
-    // 3. 最終フォールバック
-    PathBuf::from("powershell.exe")
-}
-
-#[cfg(not(windows))]
-fn detect_shell_unix() -> PathBuf {
-    if let Ok(shell) = std::env::var("SHELL") {
-        let p = PathBuf::from(&shell);
-        if p.exists() { return p; }
-    }
-    PathBuf::from("/bin/sh")
-}
-```
-
-Windows で Git Bash を優先するのは、Claude Code を含む多くの Unix 系 CLI が bash を前提にしているため。PowerShell だけだと `ls -la` や `grep` がそのままでは通らない。
-
-## OSC 7 の注入で cwd を追跡
-
-シェルの `cd` は ccmux から直接見えないので、プロンプトのたびにシェル自身に**現在のパスを放送**させます。bash なら `PROMPT_COMMAND` に仕込む:
-
-```rust
-if shell_name.contains("bash") {
-    let setup = concat!(
-        " __ccmux_osc7() { printf '\\033]7;file://%s%s\\007' \"$HOSTNAME\" \"$PWD\"; };",
-        " PROMPT_COMMAND=\"__ccmux_osc7;${PROMPT_COMMAND}\";",
-        " clear\n",
-    );
-    writer.write_all(setup.as_bytes())?;
-}
-```
-
-- 行頭のスペース `" __ccmux..."` がポイント。bash の `HISTCONTROL=ignorespace` が効いていると、先頭スペースのコマンドが履歴に残らない。ユーザーの `Ctrl+R` を汚さない小さな工夫
-- OSC 7 は `ESC ] 7 ; file://HOST/PATH BEL` という形のエスケープ。ターミナルエミュレータ側で読み取ると cwd を通知できる
-- ccmux の vt100 パーサが OSC を検知して、ペインごとの cwd 追跡に使っています
-
-zsh は `precmd_functions` 配列で同じことをします。
-
-## ネストした ccmux 検出
-
-ccmux を ccmux の中で起動すると、PTY の中で PTY を走らせることになって、入力が二重に PTY を通過して壊れます。これを防ぐため、子シェルに `CCMUX=1` を注入しておき、メインの `main.rs` 先頭で:
-
-```rust
+```rust title="src/main.rs"
 if std::env::var("CCMUX").is_ok() {
-    eprintln!("ccmux: already running inside a ccmux pane (nested instance not allowed).");
-    eprintln!("       Open a new tab with Ctrl+T or split with Ctrl+D / Ctrl+E instead.");
+    eprintln!("ccmux: already running inside a ccmux pane.");
     std::process::exit(1);
 }
 ```
 
-小さいチェックですが、あるとないとで「なぜか動かない」系の事故が激減します。
+「**なぜか動かない**」系のバグを事前に潰せる、地味だけど価値ある一行。
 
-## まとめ
+---
 
-PTY は OS ごとに実装がまちまちなのに、portable-pty のおかげで**OS 分岐を一度も書かずに**ccmux の PTY まわりは書けています。クロスプラットフォーム Rust TUI の強い味方です。
-
-次に書こうとしているのは、この PTY を経由して入ってくるバイトストリームを vt100 パーサに食わせ、ratatui に描画する部分の最適化（アイドル時 0% CPU を狙う話）です。
+クロスプラットフォームの PTY は普通に書こうとすると `#[cfg(...)]` が大量に出てきて辛いんですが、**portable-pty に任せると一切出てこない**。ccmux が「Windows でも動く」のは、小さいなりにこのクレートの恩恵が大きいです。

@@ -1,29 +1,40 @@
 ---
-title: 'Claude Code の JSONL を読む'
-description: 'ローカルの JSONL から、サブエージェント・TodoList・トークン使用量をライブで拾う仕組み。'
+title: 'Claude Code の "今" を、ログから読む'
+description: 'ccmux のステータスバーに出る「🔧 Bash」「45.2k tokens」はどこから来ているのか。Claude Code が残すログファイルを覗いてみる話。'
 pubDate: 2026-04-13
 tags: ['claude-code', 'rust', 'monitoring']
 ---
 
-ccmux のステータスバーに出る「🤖 evaluator · 🔧 Bash · ▓▓░░ 3/8 · 45.2k tokens」は、**Claude Code が吐いているローカルの JSONL を読んで**作っています。公開 API を叩いているわけではなく、ユーザーのマシン内で完結する情報です。
-
-このファイルの場所・構造・気をつけるポイントを整理します。
-
-## ファイルの場所
-
-Claude Code は会話ログを次の場所に書き出します:
+ccmux のペインには、こんな表示が出ます:
 
 ```
-~/.claude/projects/<encoded-cwd>/<uuid>.jsonl
+● claude [1] 🤖 evaluator 🔧 Bash  ▓▓░░ 3/8 · 45.2k tokens
 ```
 
-`encoded-cwd` は**現在の作業ディレクトリのパスを、英数字以外すべて `-` に置換**したものです。例えば `C:\Users\じゅぶ\Desktop\dev\ccmux` は:
+- 今サブエージェントが動いている（🤖 evaluator）
+- その中で Bash を走らせている（🔧 Bash）
+- TodoList は 8 個中 3 個が済んでいる
+- セッション全体で 45,200 トークン使った
+
+これ、**Claude Code に何か組み込んでもらっているわけではありません**。Claude Code が普通に残しているログファイルを、ccmux がそっと覗いているだけです。
+
+## ログの場所
+
+Claude Code は会話ログをこの場所に書き出しています:
+
+```
+~/.claude/projects/<プロジェクト名>/<UUID>.jsonl
+```
+
+プロジェクト名は「今いるディレクトリのパス」を変換したもの。例えば `C:\Users\じゅぶ\Desktop\dev\ccmux` は:
 
 ```
 C--Users-----Desktop-dev-ccmux
 ```
 
-日本語の 3 文字 `じゅぶ` が `---` に潰れているのがミソで、初期の実装では ASCII 英数字だけを保持して他を取り除いていたため、日本語パスのユーザーだけ JSONL が見つからない不具合がありました。
+になります。**英数字以外は全部 `-` に置換**されるので、「じゅぶ」の 3 文字が `---` に潰れているわけです。
+
+実装当初、ccmux は ASCII だけ残して他を落とす処理をしていて、**日本語パスのユーザーだけログが見つからない**という静かなバグになってました。
 
 ```rust title="src/claude_monitor.rs"
 fn encode_cwd_to_project_name(cwd: &Path) -> String {
@@ -34,61 +45,67 @@ fn encode_cwd_to_project_name(cwd: &Path) -> String {
 }
 ```
 
+**一次情報（実ファイル）を信じる**、という学び。
+
 ## JSONL の中身
 
-各行は 1 イベント。抜粋するとこんな形:
+JSONL は「1 行 1 イベント」の JSON です。中身はこんな感じ:
 
 ```json
-{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_01...","name":"Bash","input":{"command":"ls"}}]},"requestId":"req_01...","usage":{"input_tokens":12,"cache_read_input_tokens":15234,"output_tokens":8}}
+{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_01...","name":"Bash","input":{"command":"ls"}}]},"usage":{"input_tokens":12,"output_tokens":8}}
 {"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_01...","content":"README.md\nsrc\n..."}]}}
-{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Agent","input":{"subagent_type":"evaluator","prompt":"..."}}]}}
 ```
 
-ccmux が拾っているフィールドは主に:
+ccmux が見ているのは主にこの 4 つ:
 
-- **`type` + `message.content[].type`**: `tool_use` / `tool_result` / `text`
-- **`tool_use.name`**: 現在実行中のツール名（Bash / Edit / Read / Agent など）
-- **`tool_use.input.subagent_type`**: `Agent` ツール経由で spawn したサブエージェントの種類
-- **`usage.*`**: トークン消費量
-- **`message.stop_reason`**: `tool_use` なら作業継続中、`end_turn`/`null` なら完了
+| フィールド | 何がわかるか |
+|---|---|
+| `tool_use.name` | 今動いているツール（Bash / Edit / Read / Agent） |
+| `tool_use.input.subagent_type` | サブエージェントの種類 |
+| `usage.*` | トークン消費量 |
+| `message.stop_reason` | 作業中か完了か |
 
-## 二重計上を避ける
+これをファイルの末尾まで舐めるだけで、さっきのステータス行が組み立てられます。
 
-トークン計算でハマったのが、**同じ `requestId` のレコードが 3 回続けて現れる**こと。Claude Code は 1 つのターンに対して複数エントリを書き、そのそれぞれが同じ usage を持っています。単純に足すとトークン消費が 3 倍に見える。
+## ハマりどころ: トークン二重計上
+
+単純に `usage.input_tokens` を全部足したら、**実際の 3 倍**になりました。
+
+原因は、**1 つのリクエストに対して同じ usage が 3 回書かれる**から。Claude Code は 1 ターンで複数行のイベントを書き出し、そのどれもに同じトークン情報を載せます。
+
+解決は `requestId` を覚えておくだけ:
 
 ```rust
-if let Some(req_id) = extract_request_id(&event) {
-    if !self.counted_request_ids.insert(req_id.to_string()) {
-        return; // already counted this request
-    }
+if !self.counted_request_ids.insert(req_id.to_string()) {
+    return; // 見たことある ID ならスキップ
 }
-self.state.input_tokens += usage.input_tokens;
-// ...
 ```
 
-`HashSet<String>` で `requestId` を覚えておき、二回目以降をスキップ。
+## ハマりどころ: ファイルがどんどん伸びる
 
-## ストリーミング読み取り
+Claude Code はログに追記し続けるので、ccmux 側は:
 
-Claude Code は JSONL にどんどん追記していくので、ccmux は:
+1. 前回読んだ位置 (`file_position`) を覚えておく
+2. ファイルの更新時刻を見て、変わってたら開く
+3. 前回位置からだけ読む
+4. ファイルが縮んでいたら（セッション切替）位置をリセット
 
-1. `file_position` を保持
-2. `mtime` を見て、変わってたらファイルを開いて前回位置から読む
-3. ファイルサイズが前回より小さくなってたら truncation と判断し、position をリセット
-4. 500ms ごとにポーリング（短すぎると IO が無駄、長すぎるとラグが出る）
+500ms ごとにこれをチェック。短すぎると IO が無駄、長すぎるとラグが出る。500ms は体感として「ちょうどいい」です。
 
-あと、5 秒ごとに**プロジェクトディレクトリ全体を再スキャン**して新しい JSONL（＝ 新しい会話セッション）が現れていないかチェックしています。
+## ハマりどころ: UI が固まる
 
-## ロック戦略
+最初は雑にロックを取って JSONL を読んでいました。すると**描画スレッドがロック待ちで停止**して、UI がカクつく。
 
-複数ペインで同時に JSONL を読むと `Arc<Mutex<ClaudeMonitor>>` の競合が起きがち。そこで 3 段階の短いロックに分解しました:
+対策はロックを 3 段階に分けただけ:
 
-1. **短ロック**: 次に読むべきパスと `file_position` を取る
-2. **ロックなし**: ファイル IO（これが一番重い）
-3. **短ロック**: 読んだイベントを state に反映
+1. 短ロック: 次に読むべきファイルパスだけ取る
+2. **ロックなし**: ファイル IO（ここが重い）
+3. 短ロック: 読んだ結果を state に書き込む
 
-こうすると長時間ロックが走らないので、描画スレッドがブロックされて UI がカクつく現象が消えます。
+ロックを持っている時間が合計で数十 μs 程度まで縮んで、描画に影響しなくなりました。
 
 ---
 
-というわけで、**Claude Code は JSONL を公開情報として書き出してくれている**ので、それを丁寧に読むだけで色んな情報が拾えます。次回は `stop_reason` の取扱いと、サブエージェントの lifecycle 追跡について書きます。
+**Claude Code は情報を親切に書き出してくれている**ので、読み取り側は愚直でいい。ccmux のモニタリング機能は、このスタンスで成り立っています。
+
+次回は、この JSONL からサブエージェントの「起動中 / 終了」を判定する仕組みを書きます。

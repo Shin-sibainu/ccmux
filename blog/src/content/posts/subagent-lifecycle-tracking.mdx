@@ -1,174 +1,138 @@
 ---
-title: 'サブエージェントの lifecycle を追跡する'
-description: 'ccmux のステータスバーに "🤖 evaluator 🔧 Bash" と出す仕組み。tool_use と tool_result を ID で紐づける愚直な話。'
+title: 'サブエージェントが「動いてる／終わった」を当てる'
+description: '"🤖 evaluator" と表示して、終わったら消す。それだけのことを、正確にやるための小さな工夫。'
 pubDate: 2026-04-10
 tags: ['claude-code', 'rust', 'monitoring']
 ---
 
-[前回の記事](/parsing-claude-jsonl/) では Claude Code の JSONL を読む話をしました。今回はその続きで、**サブエージェントの生存状態**をどう追跡しているかを書きます。
-
-## やりたいこと
-
-Claude Code で `@.claude/agents/evaluator.md` のようなサブエージェント機能を使うと、メインのセッションが `Agent` ツールを呼んで別のエージェントを立ち上げます。ccmux ではこれを検知して、ペインのタイトルに:
+ccmux のペインのタイトルには、こんな感じでサブエージェントが出ます:
 
 ```
-● claude [1] 🤖 evaluator 🔧 Bash
+● claude [1] 🤖 evaluator, reviewer 🔧 Bash
 ```
 
-と表示しています。サブエージェントが複数同時に走っていれば `🤖 evaluator, reviewer` のように並びます。完了したら消えます。
+- 今 `evaluator` と `reviewer` の 2 つのサブエージェントが走ってる
+- そのうち片方が Bash を実行中
 
-## JSONL での見え方
+どちらかが終わると、その名前が消えます。両方終われば `🤖` 自体が消える。
 
-サブエージェント起動時:
+**どうやってこの "動いている感" を追跡してるか** の話です。
+
+## 見えているもの
+
+[前回](/parsing-claude-jsonl/) で書いた通り、ccmux は Claude Code のログファイル（JSONL）を読んでいます。その中に、こんなペアが現れる:
+
+**起動時:**
 
 ```json
 {
   "type": "assistant",
   "message": {
-    "content": [
-      {
-        "type": "tool_use",
-        "id": "toolu_01ABC...",
-        "name": "Agent",
-        "input": {
-          "subagent_type": "evaluator",
-          "prompt": "..."
-        }
-      }
-    ]
+    "content": [{
+      "type": "tool_use",
+      "id": "toolu_01ABC",
+      "name": "Agent",
+      "input": { "subagent_type": "evaluator" }
+    }]
   }
 }
 ```
 
-完了時:
+**完了時:**
 
 ```json
 {
   "type": "user",
   "message": {
-    "content": [
-      {
-        "type": "tool_result",
-        "tool_use_id": "toolu_01ABC...",
-        "content": "..."
-      }
-    ]
+    "content": [{
+      "type": "tool_result",
+      "tool_use_id": "toolu_01ABC",
+      "content": "..."
+    }]
   }
 }
 ```
 
-ポイントは:
+ポイントは **`id` と `tool_use_id` が同じ値でペアになっている** こと。この 2 つが見つかれば、開始と終了を紐づけられます。
 
-1. `tool_use.name === "Agent"` の時だけサブエージェント（他の `tool_use` は Bash や Edit など）
-2. 対応する終了は `tool_result.tool_use_id` が同じ ID のもの
-3. 並列で複数のサブエージェントが走ることがある
+## HashMap で「今動いてるやつ」を持つ
 
-## 実装: HashMap で紐づける
-
-データ構造はシンプルに:
+データ構造は、ほとんど集合演算です:
 
 ```rust title="src/claude_monitor.rs"
-pub struct ClaudeState {
-    pub subagent_types: Vec<String>,
-    pub current_tool: Option<String>,
-    // ...
-}
-
 pub struct PaneMonitor {
-    // tool_use_id → subagent_type
+    // tool_use_id → サブエージェント種別
     active_task_ids: HashMap<String, String>,
-    pub state: ClaudeState,
     // ...
 }
 ```
 
-起動イベント処理:
+起動を見たら入れる。完了を見たら消す。それだけ。
 
 ```rust
-fn on_tool_use(monitor: &mut PaneMonitor, id: &str, name: &str, input: &Value) {
-    // 表示用の「現在のツール」
-    monitor.state.current_tool = Some(name.to_string());
-
-    // Agent ツールのみサブエージェント扱い
-    if name == "Agent" {
-        if let Some(kind) = input.get("subagent_type").and_then(|v| v.as_str()) {
-            monitor.active_task_ids.insert(id.to_string(), kind.to_string());
-            refresh_subagent_list(monitor);
-        }
-    }
-}
-```
-
-完了イベント処理:
-
-```rust
-fn on_tool_result(monitor: &mut PaneMonitor, tool_use_id: &str) {
-    if monitor.active_task_ids.remove(tool_use_id).is_some() {
-        refresh_subagent_list(monitor);
+// tool_use が来た時
+if name == "Agent" {
+    if let Some(kind) = input.get("subagent_type").and_then(|v| v.as_str()) {
+        active_task_ids.insert(id.to_string(), kind.to_string());
     }
 }
 
-fn refresh_subagent_list(monitor: &mut PaneMonitor) {
-    let mut types: Vec<String> = monitor.active_task_ids.values().cloned().collect();
-    types.sort();
-    types.dedup(); // 同じ type が複数走ってても 1 つに
-    monitor.state.subagent_types = types;
+// tool_result が来た時
+active_task_ids.remove(tool_use_id);
+```
+
+表示用のリストは、**今持っている HashMap の値を並べるだけ**:
+
+```rust
+let mut types: Vec<String> = active_task_ids.values().cloned().collect();
+types.sort();
+types.dedup();
+```
+
+これで「同じ種類のサブエージェントが 2 つ動いていても 1 つに見える」まで含めて実装終わり。
+
+## ハマりどころ 1: 名前が違う
+
+最初は「サブエージェントのツール名は `Task` だろう」と決めつけてました。でも実ファイルを見たら **`Agent`** でした。`Task` だけマッチさせてた初期実装は、**何も表示されない**という静かな失敗。
+
+ドキュメントの記述と、実際に流れてるバイトが食い違うことはある。**一次情報が一番強い**。
+
+## ハマりどころ 2: 間に他のイベントが混ざる
+
+起動イベントと完了イベントは、**連続して現れるとは限りません**。間には:
+
+- ユーザーのメッセージ
+- 他の tool_use
+- アシスタントのテキスト応答
+
+などが入り乱れます。だから「次に来るのが対応する完了」とは仮定しない。必ず `tool_use_id` で紐づける。
+
+## ハマりどころ 3: 親がクラッシュしたらどうなる
+
+Claude Code のセッションを強制終了すると、**完了イベントだけ書かれずに終わる**ケースがあります。すると ccmux 側の HashMap に「永遠に走ってることになっているサブエージェント」が残ってしまう。
+
+対策は愚直で、**別セッションのログファイルが現れたら、全部リセット**:
+
+```rust
+if new_path != self.jsonl_path {
+    self.active_task_ids.clear();
+    self.state = ClaudeState::default();
+    self.jsonl_path = new_path;
 }
 ```
 
-「`tool_use_id` が来たら入れる、`tool_result` の `tool_use_id` が来たら消す」という、ほぼ集合演算です。
+ccmux 自体を再起動してもリセットされます。状態は全部 JSONL 由来なので、起動時に再スキャンするだけで復元されます。
 
-## ハマりどころ
+## 全体像
 
-### 1. ツール名の揺れ
+結局やっていることは:
 
-「サブエージェントのツール名は `Agent` なのか `Task` なのか」で混乱しました。実際の JSONL を開いて中身を見ると **`Agent`** が正解でしたが、ドキュメントには `Task` と書かれている場所もあり、初期実装では `Task` だけマッチさせていたので全く動きませんでした。
+1. 起動 → HashMap に入れる
+2. 完了 → HashMap から消す
+3. 表示 → HashMap の中身を並べる
 
-```rust
-// 両対応で書いておく
-if name == "Agent" || name == "Task" { /* ... */ }
-```
-
-一次情報（実ファイル）を信じる、という教訓。
-
-### 2. tool_use と tool_result の間に他のイベントが挟まる
-
-並列実行しているサブエージェントや、ユーザーメッセージ、アシスタントのテキスト応答などが間に入り乱れて来ます。単純な「次に来るのが対応する result」とは限らないので、必ず `tool_use_id` マッチで紐づけること。
-
-### 3. セッションを途中から読み始める問題
-
-ccmux は起動時に既存の JSONL を最初から読み直さず、**末尾に近い位置から読み始める**場合があります。すると `tool_use` を見逃して `tool_result` だけ受け取るケースが出る。
-
-この場合 `active_task_ids.remove(tool_use_id)` が `None` を返すだけで特に害はありません。HashMap に存在しない key の remove は no-op なので、安全にスキップできます。
-
-### 4. 親セッションがクラッシュした時
-
-Claude Code のセッションが強制終了すると、`tool_result` が書かれないまま `tool_use` だけが JSONL に残ります。`active_task_ids` は永遠に埋まったまま、ステータスバーに `🤖 evaluator` と残り続けます。
-
-対策として、ccmux は**別セッションの JSONL が現れたらリセット**します:
-
-```rust
-if new_jsonl_path != monitor.jsonl_path {
-    monitor.active_task_ids.clear();
-    monitor.state = ClaudeState::default();
-    monitor.jsonl_path = new_jsonl_path;
-    monitor.file_position = 0;
-}
-```
-
-## 結果として得られる表示
-
-```
-claude [1] 🤖 evaluator, reviewer 🔧 Bash  ✓ ▓▓▓░░ 3/8 ▶ 45.2k tokens
-```
-
-- `evaluator, reviewer` が同時実行中のサブエージェント
-- `🔧 Bash` が現在メインで走っているツール
-- `3/8` が TodoList の完了数
-- `45.2k tokens` が累積トークン使用量
-
-すべて**同じ JSONL を一度舐める 1 パスの処理**で出しています。Claude Code が親切にイベントを書き出してくれているおかげで、ポーリング側は愚直でよい、という良い例でした。
+「**JSON の流れから状態を持つ**」のは、こういう時に書き味がシンプルになります。イベントストリームに対して HashMap が 1 つある、という形は覚えておくと他でも使えます。
 
 ---
 
-次回は Bracketed Paste モードの話か、vt100 スクリーンバッファを ratatui にマッピングする話か、どちらか書こうと思います。
+次回は Claude Code を「起動してますよ」と判定する別のトリック（OSC ウィンドウタイトル）について書きます。
