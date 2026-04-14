@@ -1194,20 +1194,33 @@ pub fn key_event_to_bytes_pub(key: &KeyEvent) -> Option<Vec<u8>> {
 /// Convert a crossterm KeyEvent into bytes suitable for PTY input.
 fn key_event_to_bytes(key: &KeyEvent) -> Option<Vec<u8>> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
 
     match key.code {
         KeyCode::Char(c) => {
             if ctrl {
                 let ctrl_byte = (c.to_ascii_lowercase() as u8).wrapping_sub(b'a').wrapping_add(1);
                 if ctrl_byte <= 26 {
-                    Some(vec![ctrl_byte])
+                    if alt {
+                        // Alt+Ctrl+Char → ESC + ctrl byte
+                        Some(vec![0x1b, ctrl_byte])
+                    } else {
+                        Some(vec![ctrl_byte])
+                    }
                 } else {
                     Some(c.to_string().into_bytes())
                 }
+            } else if alt {
+                // Alt+Char → ESC + char (standard xterm behavior)
+                let mut bytes = vec![0x1b];
+                bytes.extend_from_slice(c.to_string().as_bytes());
+                Some(bytes)
             } else {
                 Some(c.to_string().into_bytes())
             }
         }
+        // Alt+Enter → send newline (\n) for multi-line input in Claude Code
+        KeyCode::Enter if alt => Some(vec![b'\n']),
         KeyCode::Enter => Some(vec![b'\r']),
         KeyCode::Backspace => Some(vec![0x7f]),
         KeyCode::Delete => Some(b"\x1b[3~".to_vec()),
