@@ -1,0 +1,526 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>ccmux — Claude Code を多重化する TUI</title>
+    <meta
+      name="description"
+      content="複数の Claude Code セッションを分割ペインで同時に走らせる軽量 TUI。ペインごとのトークン／コンテキスト監視、サブエージェント追跡、設定不要。"
+    />
+    <meta property="og:title" content="ccmux — Claude Code を多重化する TUI" />
+    <meta
+      property="og:description"
+      content="複数の Claude Code セッションを分割ペインで同時に走らせる軽量 TUI。ペインごとのトークン／コンテキスト監視、サブエージェント追跡、設定不要。"
+    />
+    <meta property="og:type" content="website" />
+    <meta property="og:locale" content="ja_JP" />
+
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      rel="stylesheet"
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=Noto+Sans+JP:wght@400;500;700;800&family=JetBrains+Mono:wght@400;500&display=swap"
+    />
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <nav class="nav" aria-label="メインナビゲーション">
+      <a class="nav-logo" href="/">
+        <span class="logo-mark" aria-hidden="true">◈</span>
+        <span>ccmux</span>
+      </a>
+      <div class="nav-links">
+        <a href="https://shin-sibainu.github.io/ccmux/docs/">ドキュメント</a>
+        <a href="https://shin-sibainu.github.io/ccmux/docs/features">機能</a>
+        <a
+          href="https://github.com/Shin-sibainu/ccmux"
+          class="btn btn-ghost btn-sm"
+          target="_blank"
+          rel="noopener"
+          >GitHub ↗</a
+        >
+      </div>
+    </nav>
+
+    <main>
+      <!-- HERO -->
+      <section class="hero">
+        <div class="hero-inner" data-reveal>
+          <span class="eyebrow">◈ Claude Code Multiplexer</span>
+          <h1 class="display">
+            Claude&nbsp;Code を、<br />
+            <span class="display-accent">並べて、走らせる。</span>
+          </h1>
+          <p class="lede">
+            複数の Claude Code エージェントを分割ペインで同時に動かすための
+            軽量 TUI。トークン／コンテキストのライブ監視、サブエージェント
+            追跡まで、設定ファイルなしで動きます。
+          </p>
+
+          <div class="cta-row">
+            <a
+              href="https://shin-sibainu.github.io/ccmux/docs/"
+              class="btn btn-primary"
+              target="_blank"
+              rel="noopener"
+              >はじめる →</a
+            >
+            <a
+              href="https://github.com/Shin-sibainu/ccmux"
+              class="btn btn-ghost"
+              target="_blank"
+              rel="noopener"
+              >GitHub を見る</a
+            >
+          </div>
+
+          <div
+            class="install-chip"
+            role="group"
+            aria-label="インストールコマンド"
+          >
+            <span class="chip-prompt">$</span>
+            <code>npm install -g ccmux-cli</code>
+            <button
+              class="chip-copy"
+              type="button"
+              data-copy="npm install -g ccmux-cli"
+              data-copied-label="コピー済み"
+              aria-label="インストールコマンドをコピー"
+            >
+              コピー
+            </button>
+          </div>
+
+        </div>
+
+        <!-- Terminal visual -->
+        <figure
+          class="terminal"
+          data-reveal="fade"
+          style="--reveal-delay: 160ms"
+        >
+          <div class="terminal-chrome">
+            <span class="dot dot-red"></span>
+            <span class="dot dot-yellow"></span>
+            <span class="dot dot-green"></span>
+            <span class="terminal-title">ccmux — ~/projects/app</span>
+          </div>
+          <div class="terminal-body">
+            <img
+              src="./screenshot.png"
+              alt="2 ペイン分割で Claude Code を動かしている ccmux のスクリーンショット"
+              loading="eager"
+            />
+          </div>
+        </figure>
+
+        <figcaption
+          class="terminal-caption"
+          data-reveal
+          style="--reveal-delay: 260ms"
+        >
+          <span><strong>約 2 MB</strong> バイナリ</span>
+          <span class="sep" aria-hidden="true">·</span>
+          <span><strong>0.5 秒</strong> 起動</span>
+          <span class="sep" aria-hidden="true">·</span>
+          <span><strong>ほぼ 0%</strong> アイドル CPU</span>
+          <span class="sep" aria-hidden="true">·</span>
+          <span><strong>Win · macOS · Linux</strong></span>
+        </figcaption>
+      </section>
+
+      <!-- FEATURES -->
+      <section class="features" id="features">
+        <header class="section-head" data-reveal>
+          <span class="eyebrow">Features</span>
+          <h2 class="h2">並列で回すために、必要なものだけを。</h2>
+          <p class="section-lede">
+            ccmux は PTY の上に乗せた薄くて速いレイヤーです。Claude Code を
+            一日中動かすときに欲しい機能だけを、追加の設定なしで提供します。
+          </p>
+        </header>
+
+        <div class="grid" data-reveal style="--reveal-delay: 80ms">
+          <article class="card">
+            <div class="card-icon" aria-hidden="true">◧</div>
+            <h3>ペイン分割</h3>
+            <p>
+              再帰的な縦／横分割を二分木レイアウトで管理。境界のドラッグで
+              リサイズ可能、1 タブあたり最大 16 ペイン。
+            </p>
+            <kbd>Ctrl&nbsp;+&nbsp;D</kbd>
+            <kbd>Ctrl&nbsp;+&nbsp;E</kbd>
+          </article>
+
+          <article class="card">
+            <div class="card-icon" aria-hidden="true">◆</div>
+            <h3>Claude 自動検出</h3>
+            <p>
+              Claude Code が動いているペインの枠がオレンジに変化。シェル
+              プラグインも設定も不要で、勝手に認識します。
+            </p>
+            <span class="swatch swatch-orange" aria-hidden="true"></span>
+          </article>
+
+          <article class="card">
+            <div class="card-icon" aria-hidden="true">▓</div>
+            <h3>トークン／コンテキスト表示</h3>
+            <p>
+              Claude Code のローカル JSONL から利用状況をリアルタイム表示。
+              70% で黄、90% で赤に変化するコンテキストバー付き。
+            </p>
+            <div class="mini-bar">
+              <div class="mini-bar-fill"></div>
+            </div>
+          </article>
+
+          <article class="card">
+            <div class="card-icon" aria-hidden="true">⎇</div>
+            <h3>サブエージェント追跡</h3>
+            <p>
+              Task ツール経由でサブエージェントが起動すると、その種類と
+              実行中のツールをペインタイトルに即時表示します。
+            </p>
+            <code class="inline-code">🤖 evaluator · 🔧 Bash</code>
+          </article>
+
+          <article class="card">
+            <div class="card-icon" aria-hidden="true">❒</div>
+            <h3>マルチタブ・ワークスペース</h3>
+            <p>
+              タブごとに cwd・ペインツリー・Claude モニターが独立。複数
+              プロジェクトを切替えて運用できます。
+            </p>
+            <kbd>Alt&nbsp;+&nbsp;1</kbd>…<kbd>9</kbd>
+          </article>
+
+          <article class="card">
+            <div class="card-icon" aria-hidden="true">☰</div>
+            <h3>ファイルツリー＆プレビュー</h3>
+            <p>
+              syntect によるシンタックスハイライト付きの軽量サイドバー。
+              キー一つで表示・非表示を切替、ターミナルから離れません。
+            </p>
+            <kbd>Ctrl&nbsp;+&nbsp;F</kbd>
+          </article>
+        </div>
+      </section>
+
+      <!-- WHY -->
+      <section class="why">
+        <div class="why-inner" data-reveal>
+          <span class="eyebrow">Why ccmux</span>
+          <h2 class="h2">たくさんの Claude セッションを回す人のために。</h2>
+
+          <div class="why-list">
+            <div class="why-item">
+              <span class="why-num">01</span>
+              <div>
+                <h4>Rust・vt100・PTY、奇をてらわない構成。</h4>
+                <p>
+                  ゼロアロケーション描画、dirty フラグ差分更新、PTY リサイズ
+                  キャッシュ。単一の静的バイナリで 2 MB 以下。
+                </p>
+              </div>
+            </div>
+            <div class="why-item">
+              <span class="why-num">02</span>
+              <div>
+                <h4>Windows でもネイティブ動作。</h4>
+                <p>
+                  Git Bash 自動検出と ConPTY 対応を標準搭載。Claude Code を
+                  Windows で使うのに WSL は不要です。
+                </p>
+              </div>
+            </div>
+            <div class="why-item">
+              <span class="why-num">03</span>
+              <div>
+                <h4>設定ファイルはゼロ。</h4>
+                <p>
+                  dotfiles もプラグインもなし。インストールして、起動して、
+                  ペインを分割して、Claude を立ち上げるだけ。
+                </p>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- INSTALL -->
+      <section class="install" id="install">
+        <div class="install-inner" data-reveal>
+          <span class="eyebrow">Install</span>
+          <h2 class="h2">コマンドは一つ、プラットフォームは三つ。</h2>
+          <p class="section-lede">
+            ccmux はネイティブバイナリを npm 経由で配布しています。
+            インストールスクリプトが GitHub Releases から OS に合ったビルドを
+            自動取得します。
+          </p>
+
+          <div class="code-card">
+            <div class="code-card-head">
+              <span class="code-card-title">Terminal</span>
+              <button
+                class="chip-copy"
+                type="button"
+                data-copy="npm install -g ccmux-cli&#10;ccmux"
+                data-copied-label="コピー済み"
+                aria-label="インストールと起動コマンドをコピー"
+              >
+                コピー
+              </button>
+            </div>
+            <pre><span class="code-prompt">$</span> npm install -g ccmux-cli
+<span class="code-prompt">$</span> ccmux</pre>
+          </div>
+
+          <p class="fine-print">
+            ソースからビルドしたい場合は、
+            <a href="https://shin-sibainu.github.io/ccmux/docs/getting-started"
+              >ドキュメント</a
+            >
+            の <code>cargo install</code> ／ Cargo ビルド手順を参照してください。
+          </p>
+        </div>
+      </section>
+
+      <!-- CTA -->
+      <section class="cta">
+        <div class="cta-card" data-reveal>
+          <h2 class="h2">そろそろ Alt+Tab を卒業しませんか？</h2>
+          <p>
+            4 タブで 4 プロジェクトを開き、各ペインで Claude を走らせる。
+            それだけで、進むスピードが変わります。
+          </p>
+          <div class="cta-row">
+            <a
+              href="https://shin-sibainu.github.io/ccmux/docs/getting-started"
+              class="btn btn-primary"
+              >ドキュメントを読む →</a
+            >
+            <a
+              href="https://github.com/Shin-sibainu/ccmux"
+              class="btn btn-ghost"
+              target="_blank"
+              rel="noopener"
+              >GitHub でスター ★</a
+            >
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <footer class="footer">
+      <div class="footer-inner">
+        <div class="footer-brand">
+          <span class="logo-mark" aria-hidden="true">◈</span>
+          <span>ccmux</span>
+          <span class="footer-tag">Claude Code Multiplexer</span>
+        </div>
+        <nav class="footer-links" aria-label="フッターナビゲーション">
+          <a href="https://shin-sibainu.github.io/ccmux/docs/">ドキュメント</a>
+          <a
+            href="https://github.com/Shin-sibainu/ccmux"
+            target="_blank"
+            rel="noopener"
+            >GitHub</a
+          >
+          <a href="https://www.npmjs.com/package/ccmux-cli">npm</a>
+          <a
+            href="https://claude-code-academy.dev"
+            target="_blank"
+            rel="noopener"
+            >Claude Code Academy ↗</a
+          >
+        </nav>
+        <p class="footer-fine">
+          MIT ライセンス · Anthropic 社の公式プロダクトではありません。Claude
+          および Claude Code は Anthropic, PBC の商標です。
+        </p>
+      </div>
+    </footer>
+
+    <script>
+      // Reveal-on-scroll. Marks elements with [data-reveal] visible as
+      // soon as they enter the viewport; runs exactly once per element.
+      (() => {
+        const targets = document.querySelectorAll('[data-reveal]');
+        if (!targets.length) return;
+        const reduceMotion = window.matchMedia(
+          '(prefers-reduced-motion: reduce)'
+        ).matches;
+        if (reduceMotion || !('IntersectionObserver' in window)) {
+          targets.forEach((el) => el.classList.add('is-revealed'));
+          return;
+        }
+        const io = new IntersectionObserver(
+          (entries) => {
+            for (const entry of entries) {
+              if (entry.isIntersecting) {
+                entry.target.classList.add('is-revealed');
+                io.unobserve(entry.target);
+              }
+            }
+          },
+          { threshold: 0.12, rootMargin: '0px 0px -6% 0px' }
+        );
+        targets.forEach((el) => io.observe(el));
+      })();
+
+      // Copy buttons
+      document.querySelectorAll('[data-copy]').forEach((el) => {
+        el.addEventListener('click', async () => {
+          const text = el.getAttribute('data-copy') || '';
+          const copiedLabel =
+            el.getAttribute('data-copied-label') || 'Copied';
+          try {
+            await navigator.clipboard.writeText(text);
+            const prev = el.textContent;
+            el.textContent = copiedLabel;
+            el.classList.add('is-copied');
+            setTimeout(() => {
+              el.textContent = prev;
+              el.classList.remove('is-copied');
+            }, 1400);
+          } catch (_) {
+            /* clipboard unavailable */
+          }
+        });
+      });
+
+      // Cursor-position tilt + holo-band reflection + inertial decay.
+      // On mouseleave the tilt doesn't snap back — an exponential decay
+      // RAF loop eases rx/ry toward zero, giving the card a lingering
+      // "settle" motion like a physical glass card coming to rest.
+      (() => {
+        const el = document.querySelector('.terminal');
+        if (!el) return;
+        const canHover = window.matchMedia('(hover: hover)').matches;
+        const reduceMotion = window.matchMedia(
+          '(prefers-reduced-motion: reduce)'
+        ).matches;
+        if (!canHover || reduceMotion) return;
+
+        const MAX_TILT = 7;         // degrees
+        const LIFT = 6;             // translateY(-LIFT px) at full tilt
+        const SWING = 45 / MAX_TILT; // % per degree for reflection band
+        const DECAY = 0.92;         // per-frame retention factor
+        const STOP_THRESH = 0.04;   // deg — below this we clamp to zero
+
+        let rafId = 0;
+        let pending = null;
+        let decayRafId = 0;
+
+        // Last applied state — decay interpolates from this on mouseleave.
+        let rx = 0, ry = 0;
+        let hx = 50, hy = 50;
+        let opacity = 0;
+
+        const render = () => {
+          const mag = Math.max(Math.abs(rx), Math.abs(ry)) / MAX_TILT;
+          el.style.transform =
+            `perspective(1400px) rotateX(${rx.toFixed(3)}deg) ` +
+            `rotateY(${ry.toFixed(3)}deg) ` +
+            `translateY(-${(LIFT * mag).toFixed(2)}px)`;
+          el.style.setProperty('--hx', `${hx.toFixed(1)}%`);
+          el.style.setProperty('--hy', `${hy.toFixed(1)}%`);
+          el.style.setProperty('--refl-opacity', opacity.toFixed(3));
+        };
+
+        const applyFromCursor = () => {
+          rafId = 0;
+          if (!pending) return;
+          const rect = el.getBoundingClientRect();
+          const nx = Math.max(
+            0,
+            Math.min(1, (pending.clientX - rect.left) / rect.width)
+          );
+          const ny = Math.max(
+            0,
+            Math.min(1, (pending.clientY - rect.top) / rect.height)
+          );
+          // rotateX(+) tilts TOP away → "top sinks" when cursor at top.
+          // rotateY(+) tilts LEFT forward → need rotateY(-) for "left sinks".
+          rx = (0.5 - ny) * 2 * MAX_TILT;
+          ry = (nx - 0.5) * 2 * MAX_TILT;
+          hx = 50 + ry * SWING; // ry+ (cursor right) → band right
+          hy = 50 - rx * SWING; // rx+ (cursor top)   → band up
+          opacity = 1;
+          render();
+        };
+
+        const stepDecay = () => {
+          decayRafId = 0;
+          rx *= DECAY;
+          ry *= DECAY;
+          hx = 50 + (hx - 50) * DECAY;
+          hy = 50 + (hy - 50) * DECAY;
+          opacity *= DECAY;
+
+          if (
+            Math.abs(rx) < STOP_THRESH &&
+            Math.abs(ry) < STOP_THRESH
+          ) {
+            // Settled — drop back to neutral and let CSS transitions
+            // catch any remaining sub-pixel delta.
+            rx = 0;
+            ry = 0;
+            hx = 50;
+            hy = 50;
+            opacity = 0;
+            el.style.transform = '';
+            el.style.removeProperty('--hx');
+            el.style.removeProperty('--hy');
+            el.style.removeProperty('--refl-opacity');
+            delete el.dataset.tilt;
+            return;
+          }
+
+          render();
+          decayRafId = requestAnimationFrame(stepDecay);
+        };
+
+        const cancelDecay = () => {
+          if (decayRafId) {
+            cancelAnimationFrame(decayRafId);
+            decayRafId = 0;
+          }
+        };
+
+        el.addEventListener('mouseenter', () => {
+          cancelDecay();
+          el.dataset.tilt = 'active';
+        });
+
+        el.addEventListener('mousemove', (e) => {
+          cancelDecay();
+          pending = e;
+          if (rafId) return;
+          rafId = requestAnimationFrame(applyFromCursor);
+        });
+
+        el.addEventListener('mouseleave', () => {
+          if (rafId) {
+            cancelAnimationFrame(rafId);
+            rafId = 0;
+          }
+          pending = null;
+          // If we have any active tilt, decay it; otherwise snap clean.
+          if (
+            Math.abs(rx) > STOP_THRESH ||
+            Math.abs(ry) > STOP_THRESH
+          ) {
+            decayRafId = requestAnimationFrame(stepDecay);
+          } else {
+            delete el.dataset.tilt;
+            el.style.transform = '';
+            el.style.setProperty('--refl-opacity', '0');
+          }
+        });
+      })();
+    </script>
+  </body>
+</html>

@@ -4,3 +4,7 @@
 /docs/out
 image.png
 image copy.png
+image copy 2.png
+.vscode/
+.playwright-mcp/
+/lp-*.png
