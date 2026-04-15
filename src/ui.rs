@@ -52,6 +52,7 @@ fn file_icon(name: &str) -> (&'static str, Color) {
 
 pub fn render(app: &mut App, frame: &mut Frame) {
     let area = frame.area();
+    app.last_term_size = (area.width, area.height);
 
     if area.width < MIN_TERMINAL_WIDTH || area.height < MIN_TERMINAL_HEIGHT {
         let msg = Paragraph::new("Terminal too small")
@@ -316,7 +317,7 @@ fn render_panes(app: &mut App, frame: &mut Frame, area: Rect) {
         if let Some(pane) = app.ws_mut().panes.get_mut(&pane_id) {
             let inner_rows = rect.height.saturating_sub(2);
             let inner_cols = rect.width.saturating_sub(2);
-            let _ = pane.resize(inner_rows, inner_cols);
+            let _ = pane.resize(inner_rows, inner_cols); // now returns Result<bool>
         }
     }
 
@@ -341,7 +342,9 @@ fn render_panes(app: &mut App, frame: &mut Frame, area: Rect) {
     for (pane_id, rect) in rects {
         if let Some(pane) = app.ws().panes.get(&pane_id) {
             let is_focused = pane_id == focused_id && focus_target == FocusTarget::Pane;
-            let pane_sel = selection.as_ref().filter(|s| s.pane_id == pane_id);
+            let pane_sel = selection.as_ref().filter(|s| {
+                matches!(s.target, crate::app::SelectionTarget::Pane(id) if id == pane_id)
+            });
             let claude_state = app.claude_monitor.state(pane_id);
             render_single_pane(pane, is_focused, pane_sel, &claude_state, frame, rect);
         }
@@ -677,6 +680,76 @@ fn render_preview(app: &App, frame: &mut Frame, area: Rect) {
 
         let paragraph = Paragraph::new(Line::from(spans)).style(Style::default().bg(PANEL_BG));
         frame.render_widget(paragraph, Rect::new(inner.x, y, inner.width, 1));
+    }
+
+    // Selection highlight overlay. Painted after the text so it
+    // inverts colors of cells already in the buffer, matching the
+    // pane selection style. The right edge of each row's highlight
+    // is clamped to the actual line width (not the content area
+    // width) so the painted band never extends past the text that
+    // extract_preview_selected_text will actually copy.
+    if let Some(sel) = app.selection.as_ref() {
+        if matches!(sel.target, crate::app::SelectionTarget::Preview) {
+            let (sr, sc, er, ec) = sel.normalized();
+            if sr != er || sc != ec {
+                let content = sel.content_rect;
+                let scroll = ws.preview.scroll_offset;
+                let lines_len = ws.preview.lines.len();
+                let buf = frame.buffer_mut();
+                for screen_row in sr..=er {
+                    let y = content.y + screen_row;
+                    if y >= content.y + content.height {
+                        break;
+                    }
+                    // Resolve the absolute line index this screen row
+                    // maps to under the current scroll. If it's past
+                    // EOF, skip (selection was made on a longer file
+                    // or we've scrolled past).
+                    let abs = scroll + screen_row as usize;
+                    if abs >= lines_len {
+                        break;
+                    }
+                    let line_width = ws
+                        .preview
+                        .lines
+                        .get(abs)
+                        .map(|s| unicode_width::UnicodeWidthStr::width(s.as_str()) as u16)
+                        .unwrap_or(0);
+                    // No content on this line → nothing to highlight.
+                    if line_width == 0 {
+                        continue;
+                    }
+
+                    let col_start = if screen_row == sr { sc } else { 0 };
+                    let row_col_end = if screen_row == er { ec } else {
+                        line_width.saturating_sub(1)
+                    };
+                    // Clamp to both the content area and the actual
+                    // line width so trailing blank cells don't get
+                    // painted.
+                    let col_end = row_col_end
+                        .min(content.width.saturating_sub(1))
+                        .min(line_width.saturating_sub(1));
+                    if col_start > col_end {
+                        continue;
+                    }
+
+                    for screen_col in col_start..=col_end {
+                        let x = content.x + screen_col;
+                        if x >= content.x + content.width {
+                            break;
+                        }
+                        if let Some(cell) = buf.cell_mut((x, y)) {
+                            cell.set_style(
+                                Style::default()
+                                    .fg(Color::Rgb(0x0d, 0x11, 0x17))
+                                    .bg(Color::Rgb(0x58, 0xa6, 0xff)),
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 

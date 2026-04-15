@@ -208,15 +208,27 @@ fn split_rect(area: Rect, direction: SplitDirection, ratio: f32) -> (Rect, Rect)
 
 // ─── Text Selection ───────────────────────────────────────
 
-/// Text selection state within a pane.
+/// What the current text selection is anchored to.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SelectionTarget {
+    Pane(usize),
+    Preview,
+}
+
+/// Text selection state. Works for both terminal panes and the file
+/// preview panel — `target` tells rendering and extraction which
+/// source to read.
 #[derive(Debug, Clone)]
 pub struct TextSelection {
-    pub pane_id: usize,
+    pub target: SelectionTarget,
     pub start_row: u16,
     pub start_col: u16,
     pub end_row: u16,
     pub end_col: u16,
-    pub pane_rect: Rect, // inner area of the pane (for coordinate mapping)
+    /// Content area used for coordinate mapping — the inside of the
+    /// pane border, or (for previews) the area excluding the line
+    /// number gutter.
+    pub content_rect: Rect,
 }
 
 impl TextSelection {
@@ -317,6 +329,16 @@ pub struct App {
     next_pane_id: usize,
     pub dirty: bool,
     pub paste_cooldown: u8, // frames to skip rendering after paste
+    /// Frames to skip rendering after a layout change (split, close,
+    /// sidebar toggle, terminal resize). Gives Claude Code / bash time
+    /// to process SIGWINCH and send a fresh redraw before we paint,
+    /// avoiding the brief "old buffer at new size" garbled frame.
+    pub resize_cooldown: u8,
+    /// Last known terminal size (cols, rows). Updated from main.rs on
+    /// Event::Resize and from ui::render on every frame. Used by
+    /// `relayout_panes()` so layout-change handlers can resize PTYs
+    /// without needing a Frame reference.
+    pub last_term_size: (u16, u16),
     // Shared settings
     pub file_tree_width: u16,
     pub preview_width: u16,
@@ -359,6 +381,8 @@ impl App {
             next_pane_id: 2,
             dirty: true,
             paste_cooldown: 0,
+            resize_cooldown: 0,
+            last_term_size: (cols, rows),
             file_tree_width: 20,
             preview_width: 40,
             layout_swapped: true,
@@ -387,6 +411,106 @@ impl App {
         }
     }
 
+    /// Drop the current selection if it targets the preview. Called
+    /// whenever preview state shifts (scroll, new file) so the
+    /// highlighted range can't point at different text than what
+    /// Ctrl+C or mouse-up actually copies.
+    fn clear_selection_if_preview(&mut self) {
+        if matches!(
+            self.selection.as_ref().map(|s| &s.target),
+            Some(SelectionTarget::Preview)
+        ) {
+            self.selection = None;
+        }
+    }
+
+    /// Recompute pane rectangles and apply sizes to every PTY in the
+    /// active workspace. Returns `true` if any pane was actually
+    /// resized (so callers can decide whether to enter the post-resize
+    /// cooldown). Safe to call without a Frame — uses the cached
+    /// `last_term_size`.
+    pub fn relayout_panes(&mut self) -> bool {
+        let (cols, rows) = self.last_term_size;
+        if cols < 20 || rows < 5 {
+            return false;
+        }
+
+        // Mirror the area math in ui::render / render_main_area,
+        // including the fallback where tree / preview are hidden when
+        // the terminal is too narrow. Keeping these in sync prevents
+        // PTY size drift from the actually-painted pane size.
+        const MIN_PANE_AREA_WIDTH: u16 = 20;
+        let tab_h = 1u16;
+        let status_h = 1u16;
+        let main_h = rows.saturating_sub(tab_h + status_h);
+
+        let mut has_tree = self.ws().file_tree_visible;
+        let mut has_preview = self.ws().preview.is_active();
+        let tree_w_nom = self.file_tree_width;
+        let preview_w_nom = self.preview_width;
+
+        let needed = MIN_PANE_AREA_WIDTH
+            + if has_tree { tree_w_nom } else { 0 }
+            + if has_preview { preview_w_nom } else { 0 };
+        if cols < needed && has_preview {
+            has_preview = false;
+        }
+        let needed = MIN_PANE_AREA_WIDTH + if has_tree { tree_w_nom } else { 0 };
+        if cols < needed && has_tree {
+            has_tree = false;
+        }
+
+        let tree_w = if has_tree { tree_w_nom } else { 0 };
+        let preview_w = if has_preview { preview_w_nom } else { 0 };
+        let pane_w = cols.saturating_sub(tree_w).saturating_sub(preview_w);
+
+        // x/y exact values don't matter for calculate_rects' sub-areas,
+        // only width/height propagate into the recursive split sizes.
+        let pane_area = Rect::new(0, tab_h, pane_w, main_h);
+        let rects = self.ws().layout.calculate_rects(pane_area);
+
+        let mut any_changed = false;
+        for (pane_id, rect) in &rects {
+            if let Some(pane) = self.ws_mut().panes.get_mut(pane_id) {
+                let inner_rows = rect.height.saturating_sub(2);
+                let inner_cols = rect.width.saturating_sub(2);
+                if pane.resize(inner_rows, inner_cols).unwrap_or(false) {
+                    any_changed = true;
+                }
+            }
+        }
+
+        self.ws_mut().last_pane_rects = rects;
+        any_changed
+    }
+
+    /// Mark a layout change: apply resizes immediately and, if sizes
+    /// actually changed, delay the next paint for a few frames so the
+    /// PTY child can respond to SIGWINCH with a fresh redraw before
+    /// we render. When no size changes happen (e.g. a sidebar toggle
+    /// that fits in the same remaining width) we skip the cooldown so
+    /// the UI stays responsive. Also drops any live selection, whose
+    /// stored `content_rect` / `pane_id` could reference a layout that
+    /// no longer exists.
+    pub fn mark_layout_change(&mut self) {
+        let changed = self.relayout_panes();
+        if changed {
+            // Take max so a freshly-triggered layout change on top of
+            // an existing cooldown doesn't prematurely cut the wait.
+            self.resize_cooldown = self.resize_cooldown.max(5);
+        }
+        // Any in-flight selection is bound to the old geometry.
+        self.selection = None;
+        self.dirty = true;
+    }
+
+    /// Called from main.rs on crossterm Resize events so we can update
+    /// the cached terminal size and propagate the resize into panes.
+    pub fn on_terminal_resize(&mut self, cols: u16, rows: u16) {
+        self.last_term_size = (cols, rows);
+        self.mark_layout_change();
+    }
+
     /// Get the active workspace.
     pub fn ws(&self) -> &Workspace {
         &self.workspaces[self.active_tab]
@@ -411,12 +535,21 @@ impl App {
             if let Some(ref sel) = self.selection.clone() {
                 let (sr, sc, er, ec) = sel.normalized();
                 if sr != er || sc != ec {
-                    let text = self
-                        .ws()
-                        .panes
-                        .get(&sel.pane_id)
-                        .map(|p| extract_selected_text(p, sr, sc, er, ec))
-                        .unwrap_or_default();
+                    let text = match sel.target {
+                        SelectionTarget::Pane(pane_id) => self
+                            .ws()
+                            .panes
+                            .get(&pane_id)
+                            .map(|p| extract_selected_text(p, sr, sc, er, ec))
+                            .unwrap_or_default(),
+                        SelectionTarget::Preview => extract_preview_selected_text(
+                            &self.ws().preview,
+                            sr,
+                            sc,
+                            er,
+                            ec,
+                        ),
+                    };
                     if !text.is_empty() {
                         self.copy_to_clipboard(&text);
                     }
@@ -433,16 +566,16 @@ impl App {
             return Ok(true);
         }
 
-        // Ctrl+PageDown — next tab
-        if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::PageDown {
+        // Alt+Right — next tab
+        if key.modifiers == KeyModifiers::ALT && key.code == KeyCode::Right {
             if !self.workspaces.is_empty() {
                 self.active_tab = (self.active_tab + 1) % self.workspaces.len();
             }
             return Ok(true);
         }
 
-        // Ctrl+PageUp — previous tab
-        if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::PageUp {
+        // Alt+Left — previous tab
+        if key.modifiers == KeyModifiers::ALT && key.code == KeyCode::Left {
             if !self.workspaces.is_empty() {
                 self.active_tab = if self.active_tab == 0 {
                     self.workspaces.len() - 1
@@ -548,6 +681,7 @@ impl App {
             KeyCode::Enter => {
                 let path = self.ws_mut().file_tree.toggle_or_select();
                 if let Some(path) = path {
+                    self.clear_selection_if_preview();
                     self.ws_mut().preview.load(&path);
                 }
                 Ok(true)
@@ -568,6 +702,7 @@ impl App {
     fn handle_preview_key(&mut self, key: KeyEvent) -> Result<bool> {
         match (key.modifiers, key.code) {
             (KeyModifiers::CONTROL, KeyCode::Char('w')) => {
+                self.clear_selection_if_preview();
                 self.ws_mut().preview.close();
                 self.ws_mut().focus_target = FocusTarget::Pane;
                 Ok(true)
@@ -577,18 +712,22 @@ impl App {
                 Ok(true)
             }
             (_, KeyCode::Char('j')) | (_, KeyCode::Down) => {
+                self.clear_selection_if_preview();
                 self.ws_mut().preview.scroll_down(1);
                 Ok(true)
             }
             (_, KeyCode::Char('k')) | (_, KeyCode::Up) => {
+                self.clear_selection_if_preview();
                 self.ws_mut().preview.scroll_up(1);
                 Ok(true)
             }
             (_, KeyCode::PageDown) => {
+                self.clear_selection_if_preview();
                 self.ws_mut().preview.scroll_down(20);
                 Ok(true)
             }
             (_, KeyCode::PageUp) => {
+                self.clear_selection_if_preview();
                 self.ws_mut().preview.scroll_up(20);
                 Ok(true)
             }
@@ -646,15 +785,25 @@ impl App {
 
     fn toggle_file_tree(&mut self) {
         let ws = self.ws_mut();
+        let was_visible = ws.file_tree_visible;
+        let will_be_visible;
         if ws.file_tree_visible && ws.focus_target == FocusTarget::FileTree {
             ws.file_tree_visible = false;
             ws.focus_target = FocusTarget::Pane;
             ws.preview.close();
+            will_be_visible = false;
         } else if ws.file_tree_visible {
             ws.focus_target = FocusTarget::FileTree;
+            will_be_visible = true;
         } else {
             ws.file_tree_visible = true;
             ws.focus_target = FocusTarget::FileTree;
+            will_be_visible = true;
+        }
+
+        // Only relayout if the pane area actually changes (visibility flipped).
+        if was_visible != will_be_visible {
+            self.mark_layout_change();
         }
     }
 
@@ -698,7 +847,11 @@ impl App {
         let ws = self.ws_mut();
         ws.panes.insert(new_id, pane);
         ws.layout.split_pane(ws.focused_pane_id, new_id, direction);
+        // Focus moves to the freshly-created pane so the user can type
+        // in it immediately after splitting.
+        ws.focused_pane_id = new_id;
 
+        self.mark_layout_change();
         Ok(())
     }
 
@@ -733,6 +886,8 @@ impl App {
         } else if let Some(&first) = remaining_ids.first() {
             ws.focused_pane_id = first;
         }
+
+        self.mark_layout_change();
     }
 
     /// Cycle focus forward: FileTree → Preview → Pane1 → Pane2 → ... → FileTree
@@ -940,6 +1095,7 @@ impl App {
                             self.ws_mut().file_tree.selected_index = entry_idx;
                             let path = self.ws_mut().file_tree.toggle_or_select();
                             if let Some(path) = path {
+                                self.clear_selection_if_preview();
                                 self.ws_mut().preview.load(&path);
                             }
                         }
@@ -1019,12 +1175,13 @@ impl App {
 
                 // Text selection: extend if active, or start new
                 if let Some(ref mut sel) = self.selection {
-                    let inner = sel.pane_rect;
+                    let inner = sel.content_rect;
                     sel.end_col = col.saturating_sub(inner.x).min(inner.width.saturating_sub(1));
                     sel.end_row = row.saturating_sub(inner.y).min(inner.height.saturating_sub(1));
                 } else {
-                    // Start new selection in pane
+                    // Start new selection — try pane areas first, then preview
                     let pane_rects = self.ws().last_pane_rects.clone();
+                    let mut started = false;
                     for (pane_id, rect) in pane_rects {
                         if col >= rect.x && col < rect.x + rect.width
                             && row >= rect.y && row < rect.y + rect.height
@@ -1037,14 +1194,45 @@ impl App {
                             let cell_col = col.saturating_sub(inner.x);
                             let cell_row = row.saturating_sub(inner.y);
                             self.selection = Some(TextSelection {
-                                pane_id,
+                                target: SelectionTarget::Pane(pane_id),
                                 start_row: cell_row,
                                 start_col: cell_col,
                                 end_row: cell_row,
                                 end_col: cell_col,
-                                pane_rect: inner,
+                                content_rect: inner,
                             });
+                            started = true;
                             break;
+                        }
+                    }
+                    // Preview drag selection. Content area is the inside
+                    // of the preview border minus the 5-column line-number
+                    // gutter (format "{:>4}│").
+                    if !started {
+                        if let Some(rect) = self.ws().last_preview_rect {
+                            if col >= rect.x && col < rect.x + rect.width
+                                && row >= rect.y && row < rect.y + rect.height
+                            {
+                                const GUTTER: u16 = 5;
+                                let inner = Rect::new(
+                                    rect.x + 1 + GUTTER, rect.y + 1,
+                                    rect.width.saturating_sub(2 + GUTTER),
+                                    rect.height.saturating_sub(2),
+                                );
+                                // Ignore drags that start inside the gutter
+                                if col >= inner.x && row >= inner.y {
+                                    let cell_col = col.saturating_sub(inner.x);
+                                    let cell_row = row.saturating_sub(inner.y);
+                                    self.selection = Some(TextSelection {
+                                        target: SelectionTarget::Preview,
+                                        start_row: cell_row,
+                                        start_col: cell_col,
+                                        end_row: cell_row,
+                                        end_col: cell_col,
+                                        content_rect: inner,
+                                    });
+                                }
+                            }
                         }
                     }
                 }
@@ -1056,12 +1244,21 @@ impl App {
                 if let Some(sel) = self.selection.clone() {
                     let (sr, sc, er, ec) = sel.normalized();
                     if sr != er || sc != ec {
-                        let text = self
-                            .ws()
-                            .panes
-                            .get(&sel.pane_id)
-                            .map(|p| extract_selected_text(p, sr, sc, er, ec))
-                            .unwrap_or_default();
+                        let text = match sel.target {
+                            SelectionTarget::Pane(pane_id) => self
+                                .ws()
+                                .panes
+                                .get(&pane_id)
+                                .map(|p| extract_selected_text(p, sr, sc, er, ec))
+                                .unwrap_or_default(),
+                            SelectionTarget::Preview => extract_preview_selected_text(
+                                &self.ws().preview,
+                                sr,
+                                sc,
+                                er,
+                                ec,
+                            ),
+                        };
                         if !text.is_empty() {
                             self.copy_to_clipboard(&text);
                         }
@@ -1085,6 +1282,7 @@ impl App {
                     if col >= rect.x && col < rect.x + rect.width
                         && row >= rect.y && row < rect.y + rect.height
                     {
+                        self.clear_selection_if_preview();
                         self.ws_mut().preview.scroll_up(3);
                         return;
                     }
@@ -1117,6 +1315,7 @@ impl App {
                     if col >= rect.x && col < rect.x + rect.width
                         && row >= rect.y && row < rect.y + rect.height
                     {
+                        self.clear_selection_if_preview();
                         self.ws_mut().preview.scroll_down(3);
                         return;
                     }
@@ -1269,6 +1468,42 @@ fn extract_selected_text(pane: &Pane, sr: u16, sc: u16, er: u16, ec: u16) -> Str
     }
 
     lines.join("\n")
+}
+
+/// Extract text from the file preview within a selection range.
+/// Rows are screen-relative (0 = top visible line); we translate
+/// them to absolute line indices through `scroll_offset`. Columns
+/// are character offsets into the source line; trailing whitespace
+/// is preserved in interior rows but stripped from the final line.
+fn extract_preview_selected_text(preview: &crate::preview::Preview, sr: u16, sc: u16, er: u16, ec: u16) -> String {
+    let scroll = preview.scroll_offset;
+    let lines = &preview.lines;
+    let mut out: Vec<String> = Vec::new();
+
+    for screen_row in sr..=er {
+        let abs = scroll + screen_row as usize;
+        if abs >= lines.len() {
+            break;
+        }
+        let line = &lines[abs];
+
+        let col_start = if screen_row == sr { sc as usize } else { 0 };
+        let col_end = if screen_row == er { ec as usize } else { usize::MAX };
+
+        // Char-based slicing (so multi-byte UTF-8 doesn't split mid-codepoint).
+        let chars: Vec<char> = line.chars().collect();
+        let start = col_start.min(chars.len());
+        let end = (col_end.saturating_add(1)).min(chars.len());
+        let slice: String = chars[start..end].iter().collect();
+        out.push(slice);
+    }
+
+    // Strip trailing empty lines only.
+    while out.last().map_or(false, |l| l.is_empty()) {
+        out.pop();
+    }
+
+    out.join("\n")
 }
 
 /// Public wrapper for key_event_to_bytes (used by main.rs paste detection).

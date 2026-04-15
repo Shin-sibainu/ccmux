@@ -139,15 +139,18 @@ impl Pane {
         Ok(())
     }
 
-    /// Resize the PTY and vt100 parser. No-op if size hasn't changed.
-    pub fn resize(&mut self, rows: u16, cols: u16) -> Result<()> {
+    /// Resize the PTY and vt100 parser. Returns `true` if the size
+    /// actually changed (useful for callers that want to know whether
+    /// a SIGWINCH was sent to the child). No-op and returns `false`
+    /// when the size hasn't changed.
+    pub fn resize(&mut self, rows: u16, cols: u16) -> Result<bool> {
         if rows == 0 || cols == 0 {
-            return Ok(());
+            return Ok(false);
         }
 
         // Skip if size hasn't changed
         if rows == self.last_rows && cols == self.last_cols {
-            return Ok(());
+            return Ok(false);
         }
 
         self.last_rows = rows;
@@ -169,7 +172,7 @@ impl Pane {
         // A brief blank frame is preferable to overlapping garbled output.
         parser.process(b"\x1b[2J\x1b[H");
 
-        Ok(())
+        Ok(true)
     }
 
     /// Scroll the terminal view up (into scrollback history).

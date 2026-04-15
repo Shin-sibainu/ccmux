@@ -102,8 +102,18 @@ fn run_event_loop(
             }
         }
 
-        // Only render when something changed (and not in paste cooldown)
-        if app.dirty && app.paste_cooldown == 0 {
+        // After a layout change (split/close/sidebar/terminal resize),
+        // wait a few frames so child PTYs can respond to SIGWINCH with
+        // a fresh redraw. Prevents the "old buffer at new size" flash.
+        if app.resize_cooldown > 0 {
+            app.resize_cooldown -= 1;
+            if app.resize_cooldown == 0 {
+                app.dirty = true;
+            }
+        }
+
+        // Only render when something changed (and no cooldown is active)
+        if app.dirty && app.paste_cooldown == 0 && app.resize_cooldown == 0 {
             app.dirty = false;
             terminal.draw(|frame| {
                 ui::render(app, frame);
@@ -158,8 +168,11 @@ fn run_event_loop(
                     app.handle_mouse_event(mouse);
                     app.dirty = true;
                 }
-                Event::Resize(_cols, _rows) => {
-                    app.dirty = true;
+                Event::Resize(cols, rows) => {
+                    // Propagate the new terminal size to App so every
+                    // pane's PTY gets a prompt SIGWINCH, and hold the
+                    // paint for a few frames while the children redraw.
+                    app.on_terminal_resize(cols, rows);
                 }
                 _ => {}
             }

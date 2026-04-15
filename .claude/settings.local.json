@@ -39,7 +39,10 @@
       "mcp__playwright__browser_navigate",
       "mcp__playwright__browser_console_messages",
       "mcp__playwright__browser_take_screenshot",
-      "mcp__playwright__browser_close"
+      "mcp__playwright__browser_close",
+      "Bash(npm view *)",
+      "Bash(gh release *)",
+      "Bash(git add *)"
     ]
   }
 }
