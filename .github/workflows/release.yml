@@ -65,6 +65,15 @@ jobs:
         with:
           path: artifacts
 
+      - name: Generate checksums
+        run: |
+          cd artifacts
+          sha256sum ccmux-windows-x64.exe/ccmux-windows-x64.exe \
+                    ccmux-macos-x64/ccmux-macos-x64 \
+                    ccmux-macos-arm64/ccmux-macos-arm64 \
+                    ccmux-linux-x64/ccmux-linux-x64 \
+            | sed 's|[^ ]*/||' > ../checksums.txt
+
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
@@ -74,6 +83,7 @@ jobs:
             artifacts/ccmux-macos-x64/ccmux-macos-x64
             artifacts/ccmux-macos-arm64/ccmux-macos-arm64
             artifacts/ccmux-linux-x64/ccmux-linux-x64
+            checksums.txt
 
   publish-npm:
     needs: release
