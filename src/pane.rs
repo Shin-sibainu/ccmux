@@ -213,6 +213,14 @@ impl Pane {
         parser.screen().scrollback() > 0
     }
 
+    /// Whether the guest app has enabled bracketed paste mode (DEC 2004).
+    /// When false, we must not wrap input in `\x1b[200~...\x1b[201~`
+    /// because the marker bytes would appear literally on the command line.
+    pub fn bracketed_paste_enabled(&self) -> bool {
+        let parser = self.parser.lock().unwrap_or_else(|e| e.into_inner());
+        parser.screen().bracketed_paste()
+    }
+
     /// Check if Claude Code is running in this pane (by window title).
     pub fn is_claude_running(&self) -> bool {
         if let Ok(t) = self.title.lock() {

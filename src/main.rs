@@ -192,8 +192,13 @@ fn flush_paste_buffer(app: &mut app::App, buffer: &mut Vec<u8>) -> Result<()> {
     let focused_id = app.ws().focused_pane_id;
     if let Some(pane) = app.ws_mut().panes.get_mut(&focused_id) {
         pane.scroll_reset();
-        if buffer.len() > 6 {
-            // Likely a paste — wrap in bracketed paste
+        // Only wrap rapid key bursts in bracketed paste when:
+        //   1. the guest app has DEC 2004 enabled (otherwise markers leak as text), and
+        //   2. the burst looks like pasted text (no control bytes like Backspace/ESC
+        //      that key-injection tools such as espanso produce).
+        let has_control = buffer.iter().any(|&b| b == 0x7f || b == 0x1b || b == 0x08);
+        let can_bracket = pane.bracketed_paste_enabled() && !has_control;
+        if buffer.len() > 6 && can_bracket {
             let mut data = Vec::with_capacity(buffer.len() + 12);
             data.extend_from_slice(b"\x1b[200~");
             data.extend_from_slice(buffer);
@@ -201,7 +206,6 @@ fn flush_paste_buffer(app: &mut app::App, buffer: &mut Vec<u8>) -> Result<()> {
             pane.write_input(&data)?;
             app.paste_cooldown = 5;
         } else {
-            // Normal typing — send directly
             pane.write_input(buffer)?;
         }
     }

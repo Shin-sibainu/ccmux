@@ -1579,12 +1579,18 @@ impl App {
         let focused_id = self.ws().focused_pane_id;
         if let Some(pane) = self.ws_mut().panes.get_mut(&focused_id) {
             pane.scroll_reset();
-            // Wrap in bracketed paste: \x1b[200~ ... \x1b[201~
-            let mut data = Vec::new();
-            data.extend_from_slice(b"\x1b[200~");
-            data.extend_from_slice(text.as_bytes());
-            data.extend_from_slice(b"\x1b[201~");
-            pane.write_input(&data)?;
+            // Only wrap in bracketed paste (\x1b[200~...\x1b[201~) when the
+            // guest app has DEC 2004 enabled. Otherwise the markers appear
+            // as literal "00~...01~" on the command line.
+            if pane.bracketed_paste_enabled() {
+                let mut data = Vec::with_capacity(text.len() + 12);
+                data.extend_from_slice(b"\x1b[200~");
+                data.extend_from_slice(text.as_bytes());
+                data.extend_from_slice(b"\x1b[201~");
+                pane.write_input(&data)?;
+            } else {
+                pane.write_input(text.as_bytes())?;
+            }
         }
         Ok(())
     }
