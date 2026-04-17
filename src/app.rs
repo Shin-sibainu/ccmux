@@ -1615,13 +1615,20 @@ impl App {
                     }
                 }
                 AppEvent::CwdChanged(pane_id, new_cwd) => {
+                    // Security: resolve symlinks and relative components.
+                    // Reject paths that don't resolve to a real directory
+                    // (prevents OSC 7 escape sequence path injection).
+                    let new_cwd = match new_cwd.canonicalize() {
+                        Ok(p) if p.is_dir() => p,
+                        _ => continue,
+                    };
                     for ws in &mut self.workspaces {
                         if ws.panes.contains_key(&pane_id) {
                             // Update pane's cwd
                             if let Some(pane) = ws.panes.get_mut(&pane_id) {
                                 pane.cwd = new_cwd.clone();
                             }
-                            if ws.focused_pane_id == pane_id && new_cwd.is_dir() {
+                            if ws.focused_pane_id == pane_id {
                                 let prev_show_hidden = ws.file_tree.show_hidden;
                                 ws.file_tree = FileTree::new(new_cwd.clone());
                                 // FileTree::new defaults to show_hidden=true

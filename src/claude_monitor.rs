@@ -154,6 +154,12 @@ pub struct ClaudeMonitor {
 /// Throttle interval for file metadata checks (to avoid per-frame syscalls).
 const CHECK_INTERVAL: Duration = Duration::from_millis(500);
 
+/// Maximum cached request IDs for token dedup. JSONL is read sequentially
+/// and we never re-read old lines, so clearing the set is safe — the only
+/// cost is a potential double-count of the very last request if it spans
+/// two read batches (negligible).
+const MAX_REQUEST_ID_CACHE: usize = 10_000;
+
 impl ClaudeMonitor {
     pub fn new() -> Self {
         Self::default()
@@ -325,7 +331,12 @@ fn process_event(monitor: &mut PaneMonitor, line: &str) {
             // Only count tokens when requestId is present (to dedupe).
             // Missing requestId means we can't safely deduplicate, so skip counting.
             let should_count = match &request_id {
-                Some(id) => monitor.counted_request_ids.insert(id.clone()),
+                Some(id) => {
+                    if monitor.counted_request_ids.len() >= MAX_REQUEST_ID_CACHE {
+                        monitor.counted_request_ids.clear();
+                    }
+                    monitor.counted_request_ids.insert(id.clone())
+                }
                 None => false,
             };
 
