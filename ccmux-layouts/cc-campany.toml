@@ -1,0 +1,15 @@
+# cc-campany default layout — secretary only. The secretary pane uses
+# the bash shortcut `ccs` from ~/.bashrc to launch Claude Code with the
+# `/company` persona. Department panes (engineering, research, etc.)
+# are spawned on demand via `ccmux split …` from inside the secretary
+# pane once the secretary decides they're needed.
+#
+# Usage: from the cc-campany root, run: ccmux --layout cc-campany
+
+version = 1
+name = "cc-campany"
+
+[root]
+type = "pane"
+id = "secretary"
+command = "ccc-claude"

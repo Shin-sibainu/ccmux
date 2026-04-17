@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Instant;
@@ -8,8 +8,75 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
 use ratatui::layout::Rect;
 
 use crate::filetree::FileTree;
+use crate::ipc::{self, PaneInfo, PaneRef};
+use crate::layout_config::{DirectionSpec, LayoutConfig, LayoutNodeSpec};
 use crate::pane::Pane;
 use crate::preview::Preview;
+
+/// Commands that flow from the IPC server thread into the App's event
+/// loop. Each variant carries a `oneshot::Sender` so the server thread
+/// can block-wait for the App to finish processing.
+#[allow(dead_code)] // constructed by the IPC server (wired in Step 3.3)
+#[derive(Debug)]
+pub enum AppCommand {
+    /// Snapshot the pane list of the active workspace.
+    List {
+        reply: oneshot::Sender<Vec<PaneInfo>>,
+    },
+    /// Write `data` to the target pane's PTY.
+    Send {
+        target: PaneRef,
+        data: Vec<u8>,
+        append_enter: bool,
+        reply: oneshot::Sender<std::result::Result<(), String>>,
+    },
+    /// Move keyboard focus to the target pane in the active workspace.
+    Focus {
+        target: PaneRef,
+        reply: oneshot::Sender<std::result::Result<(), String>>,
+    },
+    /// Split the target pane. If `command` is given, it's queued on the
+    /// new pane and flushed when its shell prompt appears. If `name` is
+    /// given, it's registered so later IPC calls can address the pane by
+    /// name. Returns the new pane's id on success.
+    Split {
+        target: PaneRef,
+        direction: ipc::Direction,
+        command: Option<String>,
+        name: Option<String>,
+        reply: oneshot::Sender<std::result::Result<usize, String>>,
+    },
+    /// Open a new tab with a fresh single pane. Focus switches to the
+    /// new tab (mirrors the Alt+T keybinding). Returns the new pane's
+    /// id on success.
+    NewTab {
+        command: Option<String>,
+        name: Option<String>,
+        label: Option<String>,
+        reply: oneshot::Sender<std::result::Result<usize, String>>,
+    },
+}
+
+/// Resolve a [`PaneRef`] to a concrete pane id.
+///
+/// Pure helper separated from `Workspace` so it can be unit-tested
+/// without spawning real PTYs. Returns `None` when the reference points
+/// at a pane that no longer exists (e.g. a stale name or a closed id).
+pub(crate) fn resolve_pane_ref_impl(
+    r: &PaneRef,
+    pane_names: &HashMap<String, usize>,
+    known_ids: &HashSet<usize>,
+    focused: usize,
+) -> Option<usize> {
+    match r {
+        PaneRef::Focused => known_ids.contains(&focused).then_some(focused),
+        PaneRef::Id(id) => known_ids.contains(id).then_some(*id),
+        PaneRef::Name(name) => pane_names
+            .get(name)
+            .copied()
+            .filter(|id| known_ids.contains(id)),
+    }
+}
 
 /// Events dispatched within the app.
 pub enum AppEvent {
@@ -48,8 +115,11 @@ pub enum DragTarget {
 // ─── Layout Tree ──────────────────────────────────────────
 
 /// Binary tree node for pane layout.
+#[derive(Debug)]
 pub enum LayoutNode {
-    Leaf { pane_id: usize },
+    Leaf {
+        pane_id: usize,
+    },
     Split {
         direction: SplitDirection,
         ratio: f32, // 0.0..1.0, portion allocated to first child
@@ -73,7 +143,12 @@ impl LayoutNode {
     pub fn calculate_rects(&self, area: Rect) -> Vec<(usize, Rect)> {
         match self {
             LayoutNode::Leaf { pane_id } => vec![(*pane_id, area)],
-            LayoutNode::Split { direction, ratio, first, second } => {
+            LayoutNode::Split {
+                direction,
+                ratio,
+                first,
+                second,
+            } => {
                 let (first_area, second_area) = split_rect(area, *direction, *ratio);
                 let mut result = first.calculate_rects(first_area);
                 result.extend(second.calculate_rects(second_area));
@@ -82,7 +157,12 @@ impl LayoutNode {
         }
     }
 
-    pub fn split_pane(&mut self, target_id: usize, new_id: usize, direction: SplitDirection) -> bool {
+    pub fn split_pane(
+        &mut self,
+        target_id: usize,
+        new_id: usize,
+        direction: SplitDirection,
+    ) -> bool {
         match self {
             LayoutNode::Leaf { pane_id } => {
                 if *pane_id == target_id {
@@ -111,14 +191,16 @@ impl LayoutNode {
             LayoutNode::Split { first, second, .. } => {
                 if let LayoutNode::Leaf { pane_id } = first.as_ref() {
                     if *pane_id == target_id {
-                        let second = std::mem::replace(second.as_mut(), LayoutNode::Leaf { pane_id: 0 });
+                        let second =
+                            std::mem::replace(second.as_mut(), LayoutNode::Leaf { pane_id: 0 });
                         *self = second;
                         return true;
                     }
                 }
                 if let LayoutNode::Leaf { pane_id } = second.as_ref() {
                     if *pane_id == target_id {
-                        let first = std::mem::replace(first.as_mut(), LayoutNode::Leaf { pane_id: 0 });
+                        let first =
+                            std::mem::replace(first.as_mut(), LayoutNode::Leaf { pane_id: 0 });
                         *self = first;
                         return true;
                     }
@@ -142,7 +224,13 @@ impl LayoutNode {
         path: &mut Vec<bool>, // false=first, true=second
         result: &mut Vec<(u16, SplitDirection, Vec<bool>)>,
     ) {
-        if let LayoutNode::Split { direction, ratio, first, second } = self {
+        if let LayoutNode::Split {
+            direction,
+            ratio,
+            first,
+            second,
+        } = self
+        {
             let (first_area, second_area) = split_rect(area, *direction, *ratio);
 
             // The boundary is at the edge between first and second
@@ -285,6 +373,12 @@ pub struct Workspace {
     pub panes: HashMap<usize, Pane>,
     pub layout: LayoutNode,
     pub focused_pane_id: usize,
+    /// Stable human-friendly name → pane id map, populated by layout
+    /// files (Phase 2) and by IPC `Split { id: Some(name), .. }` calls
+    /// (Phase 3). Never shrinks automatically; closing a pane leaves the
+    /// name entry dangling and `resolve_pane_ref_impl` treats it as
+    /// unknown.
+    pub pane_names: HashMap<String, usize>,
     pub file_tree: FileTree,
     pub file_tree_visible: bool,
     pub preview: Preview,
@@ -316,6 +410,7 @@ impl Workspace {
             panes,
             layout: LayoutNode::Leaf { pane_id },
             focused_pane_id: pane_id,
+            pane_names: HashMap::new(),
             file_tree_visible: true,
             preview: Preview::new(),
             focus_target: FocusTarget::Pane,
@@ -323,6 +418,12 @@ impl Workspace {
             last_file_tree_rect: None,
             last_preview_rect: None,
         })
+    }
+
+    /// Resolve a [`PaneRef`] against this workspace's panes and names.
+    pub fn resolve_pane_ref(&self, r: &PaneRef) -> Option<usize> {
+        let known: HashSet<usize> = self.panes.keys().copied().collect();
+        resolve_pane_ref_impl(r, &self.pane_names, &known, self.focused_pane_id)
     }
 
     fn shutdown(&mut self) {
@@ -346,6 +447,10 @@ pub struct App {
     pub should_quit: bool,
     pub event_tx: Sender<AppEvent>,
     pub event_rx: Receiver<AppEvent>,
+    /// Clonable sender for the IPC server thread. Drop the server thread
+    /// to stop producing commands; the receiver lives on the App side.
+    pub command_tx: Sender<AppCommand>,
+    command_rx: Receiver<AppCommand>,
     next_pane_id: usize,
     pub dirty: bool,
     pub paste_cooldown: u8, // frames to skip rendering after paste
@@ -392,6 +497,7 @@ pub struct App {
 impl App {
     pub fn new(rows: u16, cols: u16) -> Result<Self> {
         let (event_tx, event_rx) = mpsc::channel();
+        let (command_tx, command_rx) = mpsc::channel();
 
         let pane_rows = rows.saturating_sub(5); // title + tab bar + status + borders
         let pane_cols = cols.saturating_sub(2);
@@ -407,6 +513,8 @@ impl App {
             should_quit: false,
             event_tx,
             event_rx,
+            command_tx,
+            command_rx,
             next_pane_id: 2,
             dirty: true,
             paste_cooldown: 0,
@@ -473,7 +581,11 @@ impl App {
         // PTY size drift from the actually-painted pane size.
         const MIN_PANE_AREA_WIDTH: u16 = 20;
         let tab_h = 1u16;
-        let status_h: u16 = if self.status_bar_visible || self.rename_input.is_some() { 1 } else { 0 };
+        let status_h: u16 = if self.status_bar_visible || self.rename_input.is_some() {
+            1
+        } else {
+            0
+        };
         let main_h = rows.saturating_sub(tab_h + status_h);
 
         let mut has_tree = self.ws().file_tree_visible;
@@ -590,13 +702,9 @@ impl App {
                             .get(&pane_id)
                             .map(|p| extract_selected_text(p, sr, sc, er, ec))
                             .unwrap_or_default(),
-                        SelectionTarget::Preview => extract_preview_selected_text(
-                            &self.ws().preview,
-                            sr,
-                            sc,
-                            er,
-                            ec,
-                        ),
+                        SelectionTarget::Preview => {
+                            extract_preview_selected_text(&self.ws().preview, sr, sc, er, ec)
+                        }
                     };
                     if !text.is_empty() {
                         self.copy_to_clipboard(&text);
@@ -735,13 +843,21 @@ impl App {
         match key.code {
             KeyCode::Esc => {
                 self.rename_input = None;
-                if needs_relayout { self.mark_layout_change(); }
+                if needs_relayout {
+                    self.mark_layout_change();
+                }
             }
             KeyCode::Enter => {
                 let trimmed = buf.trim().to_string();
-                self.ws_mut().custom_name = if trimmed.is_empty() { None } else { Some(trimmed) };
+                self.ws_mut().custom_name = if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed)
+                };
                 self.rename_input = None;
-                if needs_relayout { self.mark_layout_change(); }
+                if needs_relayout {
+                    self.mark_layout_change();
+                }
             }
             KeyCode::Backspace => {
                 buf.pop();
@@ -750,7 +866,10 @@ impl App {
                 // Ignore chars combined with Ctrl/Alt so shortcuts like
                 // Ctrl+C don't leak into the buffer as literal letters.
                 // Shift is fine — that's just uppercase.
-                if key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) {
+                if key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                {
                     return true;
                 }
                 // Cap at something sane so a stuck key can't grow the tab bar forever.
@@ -956,7 +1075,10 @@ impl App {
         self.next_pane_id = self.next_pane_id.wrapping_add(1);
 
         // Inherit CWD from the focused pane
-        let parent_cwd = self.ws().panes.get(&self.ws().focused_pane_id)
+        let parent_cwd = self
+            .ws()
+            .panes
+            .get(&self.ws().focused_pane_id)
             .map(|p| p.cwd.clone());
 
         let pane = Pane::new_with_cwd(new_id, 10, 40, self.event_tx.clone(), parent_cwd)?;
@@ -969,6 +1091,62 @@ impl App {
 
         self.mark_layout_change();
         Ok(())
+    }
+
+    /// Apply a multi-pane layout to the active workspace.
+    ///
+    /// The workspace is expected to contain a single initial pane created
+    /// by `App::new`. The root of the layout tree is mapped onto that
+    /// initial pane; splits are produced by recursively driving
+    /// `split_focused_pane`. Each `Pane` node's `command` (if any) is
+    /// queued via `Pane::queue_startup_command`, which the main event
+    /// loop will flush once the shell prompt is observed.
+    ///
+    /// Note: Phase 2 ignores the per-split `ratio`; splits use the
+    /// existing equal-split semantics. A follow-up may extend this.
+    pub fn apply_layout(&mut self, config: &LayoutConfig) -> Result<()> {
+        let initial_pane_id = self.ws().focused_pane_id;
+        self.apply_layout_node(&config.root, initial_pane_id)?;
+        Ok(())
+    }
+
+    fn apply_layout_node(&mut self, node: &LayoutNodeSpec, target_pane_id: usize) -> Result<()> {
+        match node {
+            LayoutNodeSpec::Pane { id, command } => {
+                // Register the leaf's id as a human-friendly name so IPC
+                // clients (and external tools like `ccmux-send`) can
+                // target this pane later without tracking numeric ids.
+                if !id.is_empty() {
+                    self.ws_mut().pane_names.insert(id.clone(), target_pane_id);
+                }
+                if let Some(cmd) = command {
+                    if let Some(pane) = self.ws_mut().panes.get_mut(&target_pane_id) {
+                        pane.queue_startup_command(cmd);
+                    }
+                }
+                Ok(())
+            }
+            LayoutNodeSpec::Split {
+                direction,
+                ratio: _,
+                first,
+                second,
+            } => {
+                // split_focused_pane operates on the focused pane and
+                // moves focus to the freshly-created child, so we focus
+                // the target first, then capture the new id afterwards.
+                self.ws_mut().focused_pane_id = target_pane_id;
+                let split_dir = match direction {
+                    DirectionSpec::Vertical => SplitDirection::Vertical,
+                    DirectionSpec::Horizontal => SplitDirection::Horizontal,
+                };
+                self.split_focused_pane(split_dir)?;
+                let new_pane_id = self.ws().focused_pane_id;
+                self.apply_layout_node(first, target_pane_id)?;
+                self.apply_layout_node(second, new_pane_id)?;
+                Ok(())
+            }
+        }
     }
 
     fn close_focused_pane(&mut self) {
@@ -1136,7 +1314,9 @@ impl App {
             let needs_relayout = !self.status_bar_visible;
             self.rename_input = None;
             self.dirty = true;
-            if needs_relayout { self.mark_layout_change(); }
+            if needs_relayout {
+                self.mark_layout_change();
+            }
         }
 
         match mouse.kind {
@@ -1149,8 +1329,10 @@ impl App {
 
                 // Check tab bar clicks
                 for &(tab_idx, rect) in &self.last_tab_rects {
-                    if col >= rect.x && col < rect.x + rect.width
-                        && row >= rect.y && row < rect.y + rect.height
+                    if col >= rect.x
+                        && col < rect.x + rect.width
+                        && row >= rect.y
+                        && row < rect.y + rect.height
                     {
                         let now = Instant::now();
                         let is_double = matches!(
@@ -1175,8 +1357,10 @@ impl App {
 
                 // Check [+] new tab button
                 if let Some(rect) = self.last_new_tab_rect {
-                    if col >= rect.x && col < rect.x + rect.width
-                        && row >= rect.y && row < rect.y + rect.height
+                    if col >= rect.x
+                        && col < rect.x + rect.width
+                        && row >= rect.y
+                        && row < rect.y + rect.height
                     {
                         let _ = self.new_tab();
                         return;
@@ -1207,12 +1391,16 @@ impl App {
                     for (boundary, direction, path) in boundaries {
                         let on_border = match direction {
                             SplitDirection::Vertical => {
-                                col >= boundary.saturating_sub(1) && col <= boundary
-                                    && row >= pane_area.y && row < pane_area.y + pane_area.height
+                                col >= boundary.saturating_sub(1)
+                                    && col <= boundary
+                                    && row >= pane_area.y
+                                    && row < pane_area.y + pane_area.height
                             }
                             SplitDirection::Horizontal => {
-                                row >= boundary.saturating_sub(1) && row <= boundary
-                                    && col >= pane_area.x && col < pane_area.x + pane_area.width
+                                row >= boundary.saturating_sub(1)
+                                    && row <= boundary
+                                    && col >= pane_area.x
+                                    && col < pane_area.x + pane_area.width
                             }
                         };
                         if on_border {
@@ -1224,8 +1412,10 @@ impl App {
 
                 // Check file tree click
                 if let Some(rect) = self.ws().last_file_tree_rect {
-                    if col >= rect.x && col < rect.x + rect.width
-                        && row >= rect.y && row < rect.y + rect.height
+                    if col >= rect.x
+                        && col < rect.x + rect.width
+                        && row >= rect.y
+                        && row < rect.y + rect.height
                     {
                         self.ws_mut().focus_target = FocusTarget::FileTree;
                         let inner_y = row.saturating_sub(rect.y + 1);
@@ -1246,8 +1436,10 @@ impl App {
 
                 // Check preview click
                 if let Some(rect) = self.ws().last_preview_rect {
-                    if col >= rect.x && col < rect.x + rect.width
-                        && row >= rect.y && row < rect.y + rect.height
+                    if col >= rect.x
+                        && col < rect.x + rect.width
+                        && row >= rect.y
+                        && row < rect.y + rect.height
                     {
                         self.ws_mut().focus_target = FocusTarget::Preview;
                         return;
@@ -1257,8 +1449,10 @@ impl App {
                 // Check pane clicks
                 let pane_rects = self.ws().last_pane_rects.clone();
                 for (pane_id, rect) in pane_rects {
-                    if col >= rect.x && col < rect.x + rect.width
-                        && row >= rect.y && row < rect.y + rect.height
+                    if col >= rect.x
+                        && col < rect.x + rect.width
+                        && row >= rect.y
+                        && row < rect.y + rect.height
                     {
                         self.ws_mut().focused_pane_id = pane_id;
                         self.ws_mut().focus_target = FocusTarget::Pane;
@@ -1266,7 +1460,12 @@ impl App {
                         // Check if clicking on scrollbar (rightmost column inside border)
                         let scrollbar_col = rect.x + rect.width - 2; // -1 border, -1 scrollbar
                         if col >= scrollbar_col {
-                            let inner = Rect::new(rect.x + 1, rect.y + 1, rect.width.saturating_sub(2), rect.height.saturating_sub(2));
+                            let inner = Rect::new(
+                                rect.x + 1,
+                                rect.y + 1,
+                                rect.width.saturating_sub(2),
+                                rect.height.saturating_sub(2),
+                            );
                             self.scroll_pane_to_click(pane_id, row, &inner);
                             self.dragging = Some(DragTarget::Scrollbar(pane_id, inner));
                         }
@@ -1322,10 +1521,12 @@ impl App {
                             // Pane: screen-relative coords inside inner.
                             sel.end_col = col
                                 .saturating_sub(inner.x)
-                                .min(inner.width.saturating_sub(1)) as u32;
+                                .min(inner.width.saturating_sub(1))
+                                as u32;
                             sel.end_row = row
                                 .saturating_sub(inner.y)
-                                .min(inner.height.saturating_sub(1)) as u32;
+                                .min(inner.height.saturating_sub(1))
+                                as u32;
                         }
                         SelectionTarget::Preview => {
                             // Preview: translate screen coords to
@@ -1362,8 +1563,8 @@ impl App {
                             let h_scroll = self.ws().preview.h_scroll_offset.max(h_scroll);
                             // Clamp end_row to a valid absolute line index.
                             let lines_len = self.ws().preview.lines.len();
-                            let abs_row = (scroll_v + screen_row as usize)
-                                .min(lines_len.saturating_sub(1));
+                            let abs_row =
+                                (scroll_v + screen_row as usize).min(lines_len.saturating_sub(1));
                             let abs_col = screen_col as usize + h_scroll;
                             // Update the selection endpoint (source coords).
                             if let Some(sel) = self.selection.as_mut() {
@@ -1377,11 +1578,14 @@ impl App {
                     let pane_rects = self.ws().last_pane_rects.clone();
                     let mut started = false;
                     for (pane_id, rect) in pane_rects {
-                        if col >= rect.x && col < rect.x + rect.width
-                            && row >= rect.y && row < rect.y + rect.height
+                        if col >= rect.x
+                            && col < rect.x + rect.width
+                            && row >= rect.y
+                            && row < rect.y + rect.height
                         {
                             let inner = Rect::new(
-                                rect.x + 1, rect.y + 1,
+                                rect.x + 1,
+                                rect.y + 1,
                                 rect.width.saturating_sub(2),
                                 rect.height.saturating_sub(2),
                             );
@@ -1406,12 +1610,15 @@ impl App {
                     // survive scrolling.
                     if !started {
                         if let Some(rect) = self.ws().last_preview_rect {
-                            if col >= rect.x && col < rect.x + rect.width
-                                && row >= rect.y && row < rect.y + rect.height
+                            if col >= rect.x
+                                && col < rect.x + rect.width
+                                && row >= rect.y
+                                && row < rect.y + rect.height
                             {
                                 const GUTTER: u16 = 5;
                                 let inner = Rect::new(
-                                    rect.x + 1 + GUTTER, rect.y + 1,
+                                    rect.x + 1 + GUTTER,
+                                    rect.y + 1,
                                     rect.width.saturating_sub(2 + GUTTER),
                                     rect.height.saturating_sub(2),
                                 );
@@ -1453,13 +1660,9 @@ impl App {
                                 .get(&pane_id)
                                 .map(|p| extract_selected_text(p, sr, sc, er, ec))
                                 .unwrap_or_default(),
-                            SelectionTarget::Preview => extract_preview_selected_text(
-                                &self.ws().preview,
-                                sr,
-                                sc,
-                                er,
-                                ec,
-                            ),
+                            SelectionTarget::Preview => {
+                                extract_preview_selected_text(&self.ws().preview, sr, sc, er, ec)
+                            }
                         };
                         if !text.is_empty() {
                             self.copy_to_clipboard(&text);
@@ -1473,16 +1676,20 @@ impl App {
                 let row = mouse.row;
 
                 if let Some(rect) = self.ws().last_file_tree_rect {
-                    if col >= rect.x && col < rect.x + rect.width
-                        && row >= rect.y && row < rect.y + rect.height
+                    if col >= rect.x
+                        && col < rect.x + rect.width
+                        && row >= rect.y
+                        && row < rect.y + rect.height
                     {
                         self.ws_mut().file_tree.scroll_up(3);
                         return;
                     }
                 }
                 if let Some(rect) = self.ws().last_preview_rect {
-                    if col >= rect.x && col < rect.x + rect.width
-                        && row >= rect.y && row < rect.y + rect.height
+                    if col >= rect.x
+                        && col < rect.x + rect.width
+                        && row >= rect.y
+                        && row < rect.y + rect.height
                     {
                         self.ws_mut().preview.scroll_up(3);
                         return;
@@ -1490,8 +1697,10 @@ impl App {
                 }
                 let pane_rects = self.ws().last_pane_rects.clone();
                 for (pane_id, rect) in pane_rects {
-                    if col >= rect.x && col < rect.x + rect.width
-                        && row >= rect.y && row < rect.y + rect.height
+                    if col >= rect.x
+                        && col < rect.x + rect.width
+                        && row >= rect.y
+                        && row < rect.y + rect.height
                     {
                         if let Some(pane) = self.ws().panes.get(&pane_id) {
                             pane.scroll_up(3);
@@ -1505,16 +1714,20 @@ impl App {
                 let row = mouse.row;
 
                 if let Some(rect) = self.ws().last_file_tree_rect {
-                    if col >= rect.x && col < rect.x + rect.width
-                        && row >= rect.y && row < rect.y + rect.height
+                    if col >= rect.x
+                        && col < rect.x + rect.width
+                        && row >= rect.y
+                        && row < rect.y + rect.height
                     {
                         self.ws_mut().file_tree.scroll_down(3);
                         return;
                     }
                 }
                 if let Some(rect) = self.ws().last_preview_rect {
-                    if col >= rect.x && col < rect.x + rect.width
-                        && row >= rect.y && row < rect.y + rect.height
+                    if col >= rect.x
+                        && col < rect.x + rect.width
+                        && row >= rect.y
+                        && row < rect.y + rect.height
                     {
                         self.ws_mut().preview.scroll_down(3);
                         return;
@@ -1522,8 +1735,10 @@ impl App {
                 }
                 let pane_rects = self.ws().last_pane_rects.clone();
                 for (pane_id, rect) in pane_rects {
-                    if col >= rect.x && col < rect.x + rect.width
-                        && row >= rect.y && row < rect.y + rect.height
+                    if col >= rect.x
+                        && col < rect.x + rect.width
+                        && row >= rect.y
+                        && row < rect.y + rect.height
                     {
                         if let Some(pane) = self.ws().panes.get(&pane_id) {
                             pane.scroll_down(3);
@@ -1536,8 +1751,10 @@ impl App {
                 let col = mouse.column;
                 let row = mouse.row;
                 if let Some(rect) = self.ws().last_preview_rect {
-                    if col >= rect.x && col < rect.x + rect.width
-                        && row >= rect.y && row < rect.y + rect.height
+                    if col >= rect.x
+                        && col < rect.x + rect.width
+                        && row >= rect.y
+                        && row < rect.y + rect.height
                     {
                         self.ws_mut().preview.scroll_left(4);
                     }
@@ -1547,8 +1764,10 @@ impl App {
                 let col = mouse.column;
                 let row = mouse.row;
                 if let Some(rect) = self.ws().last_preview_rect {
-                    if col >= rect.x && col < rect.x + rect.width
-                        && row >= rect.y && row < rect.y + rect.height
+                    if col >= rect.x
+                        && col < rect.x + rect.width
+                        && row >= rect.y
+                        && row < rect.y + rect.height
                     {
                         self.ws_mut().preview.scroll_right(4);
                     }
@@ -1658,6 +1877,183 @@ impl App {
             ws.shutdown();
         }
     }
+
+    /// Drain any pending IPC commands and dispatch them. Safe to call
+    /// every frame — it's a no-op when the channel is empty. Commands
+    /// always target the active workspace.
+    pub fn drain_app_commands(&mut self) {
+        // Pop into a local Vec first so we can borrow `self` mutably
+        // inside `handle_app_command` without fighting the receiver
+        // borrow.
+        let mut cmds: Vec<AppCommand> = Vec::new();
+        while let Ok(cmd) = self.command_rx.try_recv() {
+            cmds.push(cmd);
+        }
+        for cmd in cmds {
+            self.handle_app_command(cmd);
+        }
+    }
+
+    fn handle_app_command(&mut self, cmd: AppCommand) {
+        match cmd {
+            AppCommand::List { reply } => {
+                let ws = self.ws();
+                let focused = ws.focused_pane_id;
+                // Invert pane_names so we can look up by id.
+                let mut name_by_id: HashMap<usize, String> = HashMap::new();
+                for (name, id) in &ws.pane_names {
+                    name_by_id.insert(*id, name.clone());
+                }
+                let mut infos: Vec<PaneInfo> = Vec::new();
+                for id in ws.layout.collect_pane_ids() {
+                    infos.push(PaneInfo {
+                        id,
+                        name: name_by_id.get(&id).cloned(),
+                        focused: id == focused,
+                    });
+                }
+                let _ = reply.send(infos);
+            }
+            AppCommand::Send {
+                target,
+                data,
+                append_enter,
+                reply,
+            } => {
+                let result = self.handle_send(&target, &data, append_enter);
+                let _ = reply.send(result);
+            }
+            AppCommand::Focus { target, reply } => {
+                let result = self.handle_focus(&target);
+                let _ = reply.send(result);
+            }
+            AppCommand::Split {
+                target,
+                direction,
+                command,
+                name,
+                reply,
+            } => {
+                let result = self.handle_split(&target, direction, command, name);
+                let _ = reply.send(result);
+            }
+            AppCommand::NewTab {
+                command,
+                name,
+                label,
+                reply,
+            } => {
+                let result = self.handle_new_tab(command, name, label);
+                let _ = reply.send(result);
+            }
+        }
+    }
+
+    fn handle_new_tab(
+        &mut self,
+        command: Option<String>,
+        name: Option<String>,
+        label: Option<String>,
+    ) -> std::result::Result<usize, String> {
+        // Delegate to the existing keybinding-driven new_tab so we
+        // don't drift from the interactive behavior (pane id bookkeeping,
+        // active_tab update, cwd inheritance). The freshly-created tab
+        // becomes the active one, so `ws_mut()` points at it.
+        self.new_tab().map_err(|e| e.to_string())?;
+        let new_pane_id = self.ws().focused_pane_id;
+        if let Some(cmd) = command {
+            if let Some(pane) = self.ws_mut().panes.get_mut(&new_pane_id) {
+                pane.queue_startup_command(&cmd);
+            }
+        }
+        if let Some(name) = name {
+            if !name.is_empty() {
+                self.ws_mut().pane_names.insert(name, new_pane_id);
+            }
+        }
+        if let Some(label) = label {
+            if !label.is_empty() {
+                self.ws_mut().custom_name = Some(label);
+            }
+        }
+        self.dirty = true;
+        Ok(new_pane_id)
+    }
+
+    fn handle_send(
+        &mut self,
+        target: &PaneRef,
+        data: &[u8],
+        append_enter: bool,
+    ) -> std::result::Result<(), String> {
+        let pane_id = self
+            .ws()
+            .resolve_pane_ref(target)
+            .ok_or_else(|| format!("pane not found: {target:?}"))?;
+        let pane = self
+            .ws_mut()
+            .panes
+            .get_mut(&pane_id)
+            .ok_or_else(|| "pane vanished".to_string())?;
+        pane.write_input(data).map_err(|e| e.to_string())?;
+        if append_enter {
+            pane.write_input(b"\r").map_err(|e| e.to_string())?;
+        }
+        self.dirty = true;
+        Ok(())
+    }
+
+    fn handle_focus(&mut self, target: &PaneRef) -> std::result::Result<(), String> {
+        let pane_id = self
+            .ws()
+            .resolve_pane_ref(target)
+            .ok_or_else(|| format!("pane not found: {target:?}"))?;
+        let ws = self.ws_mut();
+        ws.focused_pane_id = pane_id;
+        ws.focus_target = FocusTarget::Pane;
+        self.dirty = true;
+        Ok(())
+    }
+
+    fn handle_split(
+        &mut self,
+        target: &PaneRef,
+        direction: ipc::Direction,
+        command: Option<String>,
+        name: Option<String>,
+    ) -> std::result::Result<usize, String> {
+        let target_pane_id = self
+            .ws()
+            .resolve_pane_ref(target)
+            .ok_or_else(|| format!("pane not found: {target:?}"))?;
+        let prev_focus = self.ws().focused_pane_id;
+        self.ws_mut().focused_pane_id = target_pane_id;
+        let split_dir = match direction {
+            ipc::Direction::Vertical => SplitDirection::Vertical,
+            ipc::Direction::Horizontal => SplitDirection::Horizontal,
+        };
+        self.split_focused_pane(split_dir)
+            .map_err(|e| e.to_string())?;
+        let new_pane_id = self.ws().focused_pane_id;
+        // split_focused_pane is a no-op (keeps focus) when the pane is
+        // too small or the workspace is already at MAX_PANES; detect
+        // that by checking whether focus actually advanced.
+        if new_pane_id == target_pane_id {
+            self.ws_mut().focused_pane_id = prev_focus;
+            return Err("split refused (max panes reached or pane too small)".to_string());
+        }
+        if let Some(cmd) = command {
+            if let Some(pane) = self.ws_mut().panes.get_mut(&new_pane_id) {
+                pane.queue_startup_command(&cmd);
+            }
+        }
+        if let Some(name) = name {
+            if !name.is_empty() {
+                self.ws_mut().pane_names.insert(name, new_pane_id);
+            }
+        }
+        Ok(new_pane_id)
+    }
 }
 
 /// Extract directory name from a path for tab title.
@@ -1703,7 +2099,13 @@ fn extract_selected_text(pane: &Pane, sr: u32, sc: u32, er: u32, ec: u32) -> Str
 /// `sr`/`er` are absolute line indices; `sc`/`ec` are char offsets
 /// within the line (selection is stored in source coordinates so it
 /// survives scrolling). Trailing empty lines are stripped.
-fn extract_preview_selected_text(preview: &crate::preview::Preview, sr: u32, sc: u32, er: u32, ec: u32) -> String {
+fn extract_preview_selected_text(
+    preview: &crate::preview::Preview,
+    sr: u32,
+    sc: u32,
+    er: u32,
+    ec: u32,
+) -> String {
     let lines = &preview.lines;
     let mut out: Vec<String> = Vec::new();
 
@@ -1716,7 +2118,9 @@ fn extract_preview_selected_text(preview: &crate::preview::Preview, sr: u32, sc:
         let chars: Vec<char> = line.chars().collect();
 
         let col_start = if abs_row == sr { sc as usize } else { 0 };
-        let col_end_inclusive = if abs_row == er { ec as usize } else {
+        let col_end_inclusive = if abs_row == er {
+            ec as usize
+        } else {
             chars.len().saturating_sub(1)
         };
 
@@ -1751,7 +2155,9 @@ fn key_event_to_bytes(key: &KeyEvent) -> Option<Vec<u8>> {
     match key.code {
         KeyCode::Char(c) => {
             if ctrl {
-                let ctrl_byte = (c.to_ascii_lowercase() as u8).wrapping_sub(b'a').wrapping_add(1);
+                let ctrl_byte = (c.to_ascii_lowercase() as u8)
+                    .wrapping_sub(b'a')
+                    .wrapping_add(1);
                 if ctrl_byte <= 26 {
                     if alt {
                         // Alt+Ctrl+Char → ESC + ctrl byte
@@ -1790,9 +2196,18 @@ fn key_event_to_bytes(key: &KeyEvent) -> Option<Vec<u8>> {
         KeyCode::Insert => Some(b"\x1b[2~".to_vec()),
         KeyCode::F(n) => {
             let seq = match n {
-                1 => "\x1bOP", 2 => "\x1bOQ", 3 => "\x1bOR", 4 => "\x1bOS",
-                5 => "\x1b[15~", 6 => "\x1b[17~", 7 => "\x1b[18~", 8 => "\x1b[19~",
-                9 => "\x1b[20~", 10 => "\x1b[21~", 11 => "\x1b[23~", 12 => "\x1b[24~",
+                1 => "\x1bOP",
+                2 => "\x1bOQ",
+                3 => "\x1bOR",
+                4 => "\x1bOS",
+                5 => "\x1b[15~",
+                6 => "\x1b[17~",
+                7 => "\x1b[18~",
+                8 => "\x1b[19~",
+                9 => "\x1b[20~",
+                10 => "\x1b[21~",
+                11 => "\x1b[23~",
+                12 => "\x1b[24~",
                 _ => return None,
             };
             Some(seq.as_bytes().to_vec())
@@ -1886,5 +2301,247 @@ mod tests {
         let ids = vec![1, 2, 3];
         assert_eq!((0 + 1) % ids.len(), 1);
         assert_eq!((2 + 1) % ids.len(), 0);
+    }
+
+    // ─── resolve_pane_ref_impl (Phase 3 Step 3.2) ────────────
+
+    fn mk_ids(ids: &[usize]) -> HashSet<usize> {
+        ids.iter().copied().collect()
+    }
+
+    #[test]
+    fn resolve_focused_returns_focused_id_when_known() {
+        let names = HashMap::new();
+        let ids = mk_ids(&[1, 2, 3]);
+        assert_eq!(
+            resolve_pane_ref_impl(&PaneRef::Focused, &names, &ids, 2),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn resolve_focused_returns_none_when_focus_stale() {
+        let names = HashMap::new();
+        let ids = mk_ids(&[1, 3]);
+        assert_eq!(
+            resolve_pane_ref_impl(&PaneRef::Focused, &names, &ids, 2),
+            None
+        );
+    }
+
+    #[test]
+    fn resolve_by_id_returns_id_when_known() {
+        let names = HashMap::new();
+        let ids = mk_ids(&[1, 2, 3]);
+        assert_eq!(
+            resolve_pane_ref_impl(&PaneRef::Id(3), &names, &ids, 1),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn resolve_by_id_returns_none_when_unknown() {
+        let names = HashMap::new();
+        let ids = mk_ids(&[1, 2]);
+        assert_eq!(
+            resolve_pane_ref_impl(&PaneRef::Id(99), &names, &ids, 1),
+            None
+        );
+    }
+
+    #[test]
+    fn resolve_by_name_returns_id_when_registered() {
+        let mut names = HashMap::new();
+        names.insert("engineering".to_string(), 7);
+        let ids = mk_ids(&[1, 7]);
+        assert_eq!(
+            resolve_pane_ref_impl(&PaneRef::Name("engineering".into()), &names, &ids, 1),
+            Some(7)
+        );
+    }
+
+    #[test]
+    fn resolve_by_name_returns_none_when_unregistered() {
+        let names = HashMap::new();
+        let ids = mk_ids(&[1, 7]);
+        assert_eq!(
+            resolve_pane_ref_impl(&PaneRef::Name("missing".into()), &names, &ids, 1),
+            None
+        );
+    }
+
+    #[test]
+    fn resolve_by_name_returns_none_when_pane_closed() {
+        // Name still registered but the pane has been removed — the
+        // dangling entry must not resolve to a ghost id.
+        let mut names = HashMap::new();
+        names.insert("engineering".to_string(), 7);
+        let ids = mk_ids(&[1]); // 7 has been closed
+        assert_eq!(
+            resolve_pane_ref_impl(&PaneRef::Name("engineering".into()), &names, &ids, 1),
+            None
+        );
+    }
+
+    // ─── apply_layout integration (Phase 2 review fix) ────────
+    //
+    // These tests spawn real PTYs through App::new / Pane::new_with_cwd
+    // because apply_layout drives split_focused_pane, which unavoidably
+    // creates child shell processes. On a dev machine this costs a few
+    // milliseconds per pane; in CI it's measurable but acceptable for a
+    // handful of tests. Each test calls `app.shutdown()` at the end so
+    // the spawned shells don't linger.
+
+    fn make_pane_spec(id: &str) -> crate::layout_config::LayoutNodeSpec {
+        crate::layout_config::LayoutNodeSpec::Pane {
+            id: id.to_string(),
+            command: None,
+        }
+    }
+
+    #[test]
+    fn apply_layout_maps_split_first_to_target_and_second_to_new() {
+        // Given a 2-pane Split spec, after apply_layout:
+        // - pane_names["left"]  must point at the workspace's original
+        //   pane (what we split off)
+        // - pane_names["right"] must point at the freshly-created pane
+        // - the LayoutNode tree must have Leaf(left) in `first` and
+        //   Leaf(right) in `second`
+        // Regression guard for the reviewer's concern that the
+        // first/second recursion arms in apply_layout_node might drift.
+        let cfg = crate::layout_config::LayoutConfig {
+            version: 1,
+            name: "test".into(),
+            root: crate::layout_config::LayoutNodeSpec::Split {
+                direction: crate::layout_config::DirectionSpec::Vertical,
+                ratio: 0.5,
+                first: Box::new(make_pane_spec("left")),
+                second: Box::new(make_pane_spec("right")),
+            },
+        };
+
+        let mut app = App::new(40, 80).expect("App::new");
+        let initial_pane_id = app.ws().focused_pane_id;
+
+        app.apply_layout(&cfg).expect("apply_layout");
+
+        let ws = app.ws();
+        let left_id = *ws
+            .pane_names
+            .get("left")
+            .expect("pane_names[left] should be registered");
+        let right_id = *ws
+            .pane_names
+            .get("right")
+            .expect("pane_names[right] should be registered");
+
+        assert_eq!(
+            left_id, initial_pane_id,
+            "`first` spec ('left') must map to the original/split-target pane"
+        );
+        assert_ne!(
+            right_id, initial_pane_id,
+            "`second` spec ('right') must map to a newly-spawned pane"
+        );
+
+        match &ws.layout {
+            LayoutNode::Split { first, second, .. } => {
+                match first.as_ref() {
+                    LayoutNode::Leaf { pane_id } => {
+                        assert_eq!(*pane_id, left_id, "layout.first must be the 'left' pane")
+                    }
+                    other => panic!("expected Leaf in first, got {other:?}"),
+                }
+                match second.as_ref() {
+                    LayoutNode::Leaf { pane_id } => {
+                        assert_eq!(*pane_id, right_id, "layout.second must be the 'right' pane")
+                    }
+                    other => panic!("expected Leaf in second, got {other:?}"),
+                }
+            }
+            other => panic!("expected Split at root, got {other:?}"),
+        }
+
+        app.shutdown();
+    }
+
+    #[test]
+    fn apply_layout_nested_split_preserves_positions() {
+        // A right-heavy tree: Split { first: "A", second: Split { "B", "C" } }.
+        // After apply, the LayoutNode must mirror that shape exactly.
+        let cfg = crate::layout_config::LayoutConfig {
+            version: 1,
+            name: "nested".into(),
+            root: crate::layout_config::LayoutNodeSpec::Split {
+                direction: crate::layout_config::DirectionSpec::Vertical,
+                ratio: 0.5,
+                first: Box::new(make_pane_spec("A")),
+                second: Box::new(crate::layout_config::LayoutNodeSpec::Split {
+                    direction: crate::layout_config::DirectionSpec::Horizontal,
+                    ratio: 0.5,
+                    first: Box::new(make_pane_spec("B")),
+                    second: Box::new(make_pane_spec("C")),
+                }),
+            },
+        };
+
+        let mut app = App::new(40, 80).expect("App::new");
+        app.apply_layout(&cfg).expect("apply_layout");
+
+        let ws = app.ws();
+        let a_id = *ws.pane_names.get("A").expect("A registered");
+        let b_id = *ws.pane_names.get("B").expect("B registered");
+        let c_id = *ws.pane_names.get("C").expect("C registered");
+
+        match &ws.layout {
+            LayoutNode::Split {
+                first: outer_first,
+                second: outer_second,
+                ..
+            } => {
+                match outer_first.as_ref() {
+                    LayoutNode::Leaf { pane_id } => assert_eq!(*pane_id, a_id),
+                    other => panic!("outer.first must be Leaf(A), got {other:?}"),
+                }
+                match outer_second.as_ref() {
+                    LayoutNode::Split {
+                        first: inner_first,
+                        second: inner_second,
+                        ..
+                    } => {
+                        match inner_first.as_ref() {
+                            LayoutNode::Leaf { pane_id } => assert_eq!(*pane_id, b_id),
+                            other => panic!("inner.first must be Leaf(B), got {other:?}"),
+                        }
+                        match inner_second.as_ref() {
+                            LayoutNode::Leaf { pane_id } => assert_eq!(*pane_id, c_id),
+                            other => panic!("inner.second must be Leaf(C), got {other:?}"),
+                        }
+                    }
+                    other => panic!("outer.second must be a Split, got {other:?}"),
+                }
+            }
+            other => panic!("expected Split at root, got {other:?}"),
+        }
+
+        app.shutdown();
+    }
+
+    #[test]
+    fn app_command_channel_sends_and_receives() {
+        // Smoke-test that the AppCommand channel round-trips without
+        // panicking. We can't exercise handle_* without spawning PTYs,
+        // but confirming the types fit together catches breakage.
+        let (tx, rx) = mpsc::channel::<AppCommand>();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        tx.send(AppCommand::List { reply: reply_tx }).unwrap();
+        match rx.try_recv() {
+            Ok(AppCommand::List { reply }) => {
+                reply.send(Vec::new()).unwrap();
+                let list = reply_rx.recv().unwrap();
+                assert!(list.is_empty());
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
     }
 }
