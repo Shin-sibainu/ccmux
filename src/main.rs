@@ -1,6 +1,9 @@
 mod app;
 mod claude_monitor;
+mod cli;
 mod filetree;
+mod ipc;
+mod layout_config;
 mod pane;
 mod preview;
 mod ui;
@@ -11,29 +14,47 @@ use std::panic;
 use std::time::Duration;
 
 use anyhow::Result;
+use clap::Parser;
 use crossterm::event::{self, Event, KeyEventKind};
+use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
-use crossterm::execute;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
 fn main() -> Result<()> {
-    // Detect if running inside another ccmux instance
+    // Parse CLI args. clap handles --help / --version and exits cleanly
+    // before we enter raw mode below.
+    let cli = cli::Cli::parse();
+    cli.validate_exec()?;
+
+    // Phase 3: subcommands (`ccmux list`, `ccmux send`, …) are IPC
+    // clients and MUST be runnable from inside a ccmux pane — that's
+    // the whole point. Dispatch them before the nested-TUI guard kicks
+    // in, so the `CCMUX=1` env var set by the parent doesn't block
+    // legitimate client invocations.
+    if let Some(cmd) = cli.command.as_ref() {
+        return run_ipc_client(cmd);
+    }
+
+    // No subcommand: we're about to launch another TUI. Refuse if we're
+    // already inside a ccmux pane, since nesting vt100 parsers in
+    // vt100 parsers produces unreadable output and confuses the mouse.
     if std::env::var("CCMUX").is_ok() {
         eprintln!("ccmux: already running inside a ccmux pane (nested instance not allowed).");
-        eprintln!("       Open a new tab with Alt+T (or Ctrl+T) or split with Ctrl+D / Ctrl+E instead.");
+        eprintln!(
+            "       Open a new tab with Alt+T (or Ctrl+T) or split with Ctrl+D / Ctrl+E instead."
+        );
         std::process::exit(1);
     }
 
     // If a directory is passed as argument, cd into it first
-    if let Some(dir) = std::env::args().nth(1) {
-        let path = std::path::Path::new(&dir);
-        if path.is_dir() {
-            std::env::set_current_dir(path)?;
+    if let Some(dir) = &cli.dir {
+        if dir.is_dir() {
+            std::env::set_current_dir(dir)?;
         } else {
-            eprintln!("ccmux: not a directory: {}", dir);
+            eprintln!("ccmux: not a directory: {}", dir.display());
             std::process::exit(1);
         }
     }
@@ -61,8 +82,58 @@ fn main() -> Result<()> {
     // Get initial terminal size
     let size = terminal.size()?;
 
-    // Create app
+    // Phase 3: start the IPC server BEFORE spawning child PTYs so the
+    // first `CCMUX_SOCKET` value children see is the real one. Children
+    // inherit env from this process (via portable-pty's CommandBuilder),
+    // and we publish `CCMUX` as a "you're inside ccmux" flag here too.
+    let our_pid = std::process::id();
+    let ipc_endpoint = ipc::endpoint::endpoint_for_pid(our_pid)?;
+    std::env::set_var(ipc::endpoint::ENV_SOCKET, ipc_endpoint.as_str());
+    std::env::set_var("CCMUX", "1");
+
+    // Create app (spawns the initial pane, which captures the env above).
     let mut app = app::App::new(size.height, size.width)?;
+
+    // Session token derived from the process's start nanoseconds so a
+    // client connecting through a stale socket file whose PID got
+    // re-used cannot be silently fooled — the server echoes this token
+    // back on hello, and the client verifies it against its own expect.
+    let session_token = format!(
+        "{}-{}",
+        our_pid,
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
+    if let Err(e) = ipc::server::IpcServer::spawn(
+        ipc_endpoint.clone(),
+        app.command_tx.clone(),
+        session_token.clone(),
+    ) {
+        // IPC is non-essential for the TUI itself — fail soft so users
+        // without the required socket permissions can still use ccmux
+        // as a plain multiplexer.
+        eprintln!("ccmux: IPC server failed to start ({e}); external commands disabled.");
+    }
+
+    // Phase 1 (--exec): queue the requested command on the initial focused
+    // pane. The command will be flushed into the PTY by the main event
+    // loop once the shell prompt is ready (see `try_flush_startup`).
+    if let Some(cmd) = cli.exec.as_deref() {
+        let focused_id = app.ws().focused_pane_id;
+        if let Some(pane) = app.ws_mut().panes.get_mut(&focused_id) {
+            pane.queue_startup_command(cmd);
+        }
+    }
+
+    // Phase 2 (--layout): expand a multi-pane layout from a TOML file.
+    // Each leaf pane's command (if any) is queued via the same Phase 1
+    // mechanism so all panes flush once their shells are ready.
+    if let Some(layout_name) = cli.layout.as_deref() {
+        let cfg = layout_config::LayoutConfig::load(layout_name)?;
+        app.apply_layout(&cfg)?;
+    }
 
     // Main event loop
     let result = run_event_loop(&mut terminal, &mut app);
@@ -84,6 +155,38 @@ fn main() -> Result<()> {
     result
 }
 
+/// Handle an IPC subcommand (`ccmux send …`, `ccmux list`, etc.).
+/// Resolves the endpoint from the `CCMUX_SOCKET` env var the parent
+/// ccmux published to its child PTYs; prints the server's response to
+/// stdout and exits with a non-zero code on error so shell scripts can
+/// branch on it.
+fn run_ipc_client(cmd: &cli::IpcCommand) -> Result<()> {
+    let endpoint = ipc::endpoint::endpoint_from_env()
+        .map_err(|e| anyhow::anyhow!("{e}; run this from inside a ccmux pane"))?;
+    let request = cmd.to_request()?;
+    let response = ipc::client::send_request(&endpoint, &request)?;
+    match response {
+        ipc::Response::Ok { data } => {
+            // `null` → nothing to print; anything else goes out as
+            // pretty JSON so shell scripts can `jq` it. We don't print
+            // spurious newlines for empty responses so pipelines stay
+            // tight.
+            if !data.is_null() {
+                let pretty =
+                    serde_json::to_string_pretty(&data).unwrap_or_else(|_| data.to_string());
+                println!("{pretty}");
+            }
+            Ok(())
+        }
+        ipc::Response::Hello { .. } => {
+            // Hello should only appear as the handshake reply, never
+            // as a top-level command response.
+            Err(anyhow::anyhow!("server returned hello to a command"))
+        }
+        ipc::Response::Err { message } => Err(anyhow::anyhow!("{message}")),
+    }
+}
+
 fn run_event_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut app::App,
@@ -93,6 +196,20 @@ fn run_event_loop(
     loop {
         // Drain any PTY output events
         app.drain_pty_events();
+
+        // Phase 3: dispatch any commands delivered from the IPC server
+        // thread. No-op when the channel is empty, so it's cheap to call
+        // every frame.
+        app.drain_app_commands();
+
+        // Phase 1 (--exec): flush queued startup commands once the shell
+        // prompt is observed. This is a no-op for panes without a queued
+        // command, so it's safe to run every frame.
+        for ws in &mut app.workspaces {
+            for pane in ws.panes.values_mut() {
+                let _ = pane.try_flush_startup();
+            }
+        }
 
         // After paste, wait a few frames for PTY echo to settle
         if app.paste_cooldown > 0 {
@@ -145,7 +262,8 @@ fn run_event_loop(
                                                 }
                                                 break;
                                             }
-                                            if let Some(b) = crate::app::key_event_to_bytes_pub(&k) {
+                                            if let Some(b) = crate::app::key_event_to_bytes_pub(&k)
+                                            {
                                                 paste_buffer.extend_from_slice(&b);
                                             }
                                         }
