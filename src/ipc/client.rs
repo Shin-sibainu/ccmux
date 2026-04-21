@@ -56,6 +56,12 @@ fn converse(conn: Stream, request: &Request) -> Result<Response> {
     write_request_line(reader.get_mut(), &hello)?;
     let hello_resp = read_response_line(&mut reader)?;
     match hello_resp {
+        // TODO(session-token): verify `session_token` against an
+        // out-of-band value the caller supplies (e.g. via env var set by
+        // the running ccmux). Until we have a delivery channel for the
+        // expected token we accept any server identity; the server-side
+        // field is already populated so enabling verification is a
+        // client-only change.
         Response::Hello { .. } => {}
         Response::Err { message } => {
             return Err(anyhow!("server refused hello: {message}"));

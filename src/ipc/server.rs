@@ -17,7 +17,7 @@
 //!   with a timeout, so an unresponsive App can never hang a worker
 //!   indefinitely.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::sync::mpsc::Sender;
 use std::thread;
 use std::time::Duration;
@@ -34,6 +34,13 @@ use crate::app::AppCommand;
 /// (~30Hz), so 5s is orders of magnitude more than the expected latency
 /// — a timeout here means the App is genuinely wedged.
 const APP_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Upper bound on a single newline-delimited request. The largest valid
+/// request we emit today is a `Send` with a block of terminal input,
+/// which is comfortably under a few kilobytes; 64 KiB leaves headroom
+/// without letting a malicious client exhaust memory by streaming bytes
+/// without ever sending a newline.
+const MAX_LINE_LENGTH: u64 = 65536;
 
 pub struct IpcServer {
     pub endpoint: EndpointName,
@@ -191,8 +198,22 @@ fn handle_connection(
 }
 
 fn read_line_or_eof<R: BufRead>(reader: &mut R, buf: &mut String) -> Result<Option<()>> {
-    let n = reader.read_line(buf)?;
-    Ok(if n == 0 { None } else { Some(()) })
+    // Cap how many bytes `read_line` will consume before we see a
+    // newline. We call `Read::take` through a fully-qualified path and
+    // hand it a reborrow so the blanket `impl Read for &mut R` is
+    // selected — auto-deref would otherwise pick `<R as Read>::take`
+    // and try to move `R` by value. If the client streams
+    // `MAX_LINE_LENGTH` bytes without terminating the line, `read_line`
+    // returns early and we reject the request.
+    let mut limited = Read::take(reader.by_ref(), MAX_LINE_LENGTH);
+    let n = limited.read_line(buf)?;
+    if n == 0 {
+        return Ok(None);
+    }
+    if !buf.ends_with('\n') {
+        anyhow::bail!("request line exceeds {MAX_LINE_LENGTH} bytes");
+    }
+    Ok(Some(()))
 }
 
 fn write_response_line<W: Write>(w: &mut W, resp: &Response) -> Result<()> {
@@ -446,6 +467,41 @@ mod tests {
             }
             other => panic!("expected Ok, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn read_line_or_eof_rejects_oversized_line() {
+        // A payload longer than MAX_LINE_LENGTH with no newline must be
+        // rejected rather than silently truncated or buffered forever.
+        let oversized = vec![b'a'; (MAX_LINE_LENGTH as usize) + 16];
+        let mut reader = std::io::BufReader::new(&oversized[..]);
+        let mut buf = String::new();
+        let err = read_line_or_eof(&mut reader, &mut buf)
+            .expect_err("oversized line must error");
+        assert!(
+            err.to_string().contains("exceeds"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn read_line_or_eof_reads_normal_line() {
+        let input: &[u8] = b"hello\nleftover\n";
+        let mut reader = std::io::BufReader::new(input);
+        let mut buf = String::new();
+        let got = read_line_or_eof(&mut reader, &mut buf).unwrap();
+        assert!(got.is_some());
+        assert_eq!(buf, "hello\n");
+    }
+
+    #[test]
+    fn read_line_or_eof_returns_none_on_eof() {
+        let input: &[u8] = b"";
+        let mut reader = std::io::BufReader::new(input);
+        let mut buf = String::new();
+        let got = read_line_or_eof(&mut reader, &mut buf).unwrap();
+        assert!(got.is_none());
+        assert!(buf.is_empty());
     }
 
     #[test]

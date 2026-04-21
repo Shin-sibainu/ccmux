@@ -94,10 +94,12 @@ fn main() -> Result<()> {
     // Create app (spawns the initial pane, which captures the env above).
     let mut app = app::App::new(size.height, size.width)?;
 
-    // Session token derived from the process's start nanoseconds so a
-    // client connecting through a stale socket file whose PID got
-    // re-used cannot be silently fooled — the server echoes this token
-    // back on hello, and the client verifies it against its own expect.
+    // Session token derived from the process's start nanoseconds. The
+    // server echoes it back on hello so a future client revision can
+    // detect a stale socket file whose PID got re-used. The current
+    // in-tree client does not verify it yet (see TODO in
+    // `ipc::client::converse`); the field is populated now so the wire
+    // format doesn't need to change when we wire verification up.
     let session_token = format!(
         "{}-{}",
         our_pid,
