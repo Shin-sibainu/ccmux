@@ -282,6 +282,10 @@ pub struct Workspace {
     /// display. Not persisted; `cd` does not touch this.
     pub custom_name: Option<String>,
     pub cwd: PathBuf,
+    /// The canonicalized working directory at workspace creation time.
+    /// Used as the security boundary for OSC 7 CwdChanged events:
+    /// only paths that are sub-paths of this root are accepted.
+    pub initial_cwd: PathBuf,
     pub panes: HashMap<usize, Pane>,
     pub layout: LayoutNode,
     pub focused_pane_id: usize,
@@ -308,11 +312,17 @@ impl Workspace {
         let mut panes = HashMap::new();
         panes.insert(pane_id, pane);
 
+        // Canonicalize the initial cwd for use as the OSC 7 security boundary.
+        // Fall back to the raw path if canonicalization fails (e.g. on unusual
+        // environments) — the boundary check will still work for normal cases.
+        let initial_cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.clone());
+
         Ok(Self {
             name,
             custom_name: None,
             file_tree: FileTree::new(cwd.clone()),
             cwd,
+            initial_cwd,
             panes,
             layout: LayoutNode::Leaf { pane_id },
             focused_pane_id: pane_id,
@@ -1637,6 +1647,14 @@ impl App {
                     };
                     for ws in &mut self.workspaces {
                         if ws.panes.contains_key(&pane_id) {
+                            // Security: reject OSC 7 paths that escape the workspace's
+                            // initial working directory. This prevents a malicious
+                            // process running inside a pane from redirecting the
+                            // FileTree / Preview to an arbitrary directory by emitting
+                            // a crafted OSC 7 sequence (path traversal via PTY output).
+                            if !new_cwd.starts_with(&ws.initial_cwd) {
+                                break;
+                            }
                             // Update pane's cwd
                             if let Some(pane) = ws.panes.get_mut(&pane_id) {
                                 pane.cwd = new_cwd.clone();
