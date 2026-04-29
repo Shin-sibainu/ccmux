@@ -11,6 +11,28 @@ use crate::filetree::FileTree;
 use crate::pane::Pane;
 use crate::preview::Preview;
 
+/// Strip bracketed paste escape sequences (`\x1b[200~` and `\x1b[201~`) from
+/// paste content to prevent bracket-paste escape injection attacks.  Major
+/// terminal emulators (xterm, iTerm2, WezTerm) perform the same sanitisation.
+pub fn strip_bracket_paste_sequences(input: &[u8]) -> Vec<u8> {
+    const START: &[u8] = b"\x1b[200~";
+    const END: &[u8] = b"\x1b[201~";
+    let mut out = Vec::with_capacity(input.len());
+    let mut i = 0;
+    while i < input.len() {
+        if input[i] == 0x1b
+            && (input[i..].starts_with(START) || input[i..].starts_with(END))
+        {
+            // Skip the 6-byte sequence
+            i += 6;
+        } else {
+            out.push(input[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
 /// Events dispatched within the app.
 pub enum AppEvent {
     /// PTY output received for a pane.
@@ -1602,9 +1624,10 @@ impl App {
         if let Some(pane) = self.ws_mut().panes.get_mut(&focused_id) {
             pane.scroll_reset();
             if pane.is_bracketed_paste_enabled() {
-                let mut data = Vec::with_capacity(text.len() + 12);
+                let sanitized = strip_bracket_paste_sequences(text.as_bytes());
+                let mut data = Vec::with_capacity(sanitized.len() + 12);
                 data.extend_from_slice(b"\x1b[200~");
-                data.extend_from_slice(text.as_bytes());
+                data.extend_from_slice(&sanitized);
                 data.extend_from_slice(b"\x1b[201~");
                 pane.write_input(&data)?;
             } else {
@@ -1919,5 +1942,45 @@ mod tests {
         let ids = vec![1, 2, 3];
         assert_eq!((0 + 1) % ids.len(), 1);
         assert_eq!((2 + 1) % ids.len(), 0);
+    }
+
+    #[test]
+    fn test_strip_bracket_paste_sequences() {
+        // Normal text is unchanged
+        assert_eq!(
+            super::strip_bracket_paste_sequences(b"hello world"),
+            b"hello world"
+        );
+        // Empty input
+        assert_eq!(super::strip_bracket_paste_sequences(b""), b"");
+        // Strip end sequence
+        assert_eq!(
+            super::strip_bracket_paste_sequences(b"before\x1b[201~after"),
+            b"beforeafter"
+        );
+        // Strip start sequence
+        assert_eq!(
+            super::strip_bracket_paste_sequences(b"before\x1b[200~after"),
+            b"beforeafter"
+        );
+        // Strip both sequences (injection attack payload)
+        assert_eq!(
+            super::strip_bracket_paste_sequences(
+                b"safe\x1b[201~malicious-command\n\x1b[200~rest"
+            ),
+            b"safemalicious-command\nrest"
+        );
+        // Multiple occurrences
+        assert_eq!(
+            super::strip_bracket_paste_sequences(
+                b"\x1b[200~\x1b[201~\x1b[200~\x1b[201~"
+            ),
+            b""
+        );
+        // Partial sequence is preserved (not a full match)
+        assert_eq!(
+            super::strip_bracket_paste_sequences(b"\x1b[20"),
+            b"\x1b[20"
+        );
     }
 }

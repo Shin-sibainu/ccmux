@@ -211,9 +211,10 @@ fn flush_paste_buffer(app: &mut app::App, buffer: &mut Vec<u8>) -> Result<()> {
         pane.scroll_reset();
         if buffer.len() > 6 {
             if pane.is_bracketed_paste_enabled() {
-                let mut data = Vec::with_capacity(buffer.len() + 12);
+                let sanitized = app::strip_bracket_paste_sequences(buffer);
+                let mut data = Vec::with_capacity(sanitized.len() + 12);
                 data.extend_from_slice(b"\x1b[200~");
-                data.extend_from_slice(buffer);
+                data.extend_from_slice(&sanitized);
                 data.extend_from_slice(b"\x1b[201~");
                 pane.write_input(&data)?;
             } else {
