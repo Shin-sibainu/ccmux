@@ -135,7 +135,15 @@ impl Preview {
                 match image::ImageReader::open(path)
                     .and_then(|r| r.with_guessed_format())
                     .map_err(|e| e.to_string())
-                    .and_then(|r| r.decode().map_err(|e| e.to_string()))
+                    .and_then(|r| {
+                        let mut r = r;
+                        let mut limits = image::Limits::default();
+                        limits.max_alloc = Some(64 * 1024 * 1024); // 64MB max memory
+                        limits.max_image_width = Some(8192);
+                        limits.max_image_height = Some(8192);
+                        r.limits(limits);
+                        r.decode().map_err(|e| e.to_string())
+                    })
                 {
                     Ok(dyn_img) => {
                         self.image_protocol = Some(picker.new_resize_protocol(dyn_img));
