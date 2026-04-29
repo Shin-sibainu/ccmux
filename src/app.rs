@@ -791,8 +791,9 @@ impl App {
                 let path = self.ws_mut().file_tree.toggle_or_select();
                 if let Some(path) = path {
                     self.clear_selection_if_preview();
+                    let boundary = self.ws().initial_cwd.clone();
                     let mut picker = self.image_picker.take();
-                    self.ws_mut().preview.load(&path, picker.as_mut());
+                    self.ws_mut().preview.load(&path, picker.as_mut(), Some(&boundary));
                     self.image_picker = picker;
                 }
                 Ok(true)
@@ -1252,8 +1253,9 @@ impl App {
                             let path = self.ws_mut().file_tree.toggle_or_select();
                             if let Some(path) = path {
                                 self.clear_selection_if_preview();
+                                let boundary = self.ws().initial_cwd.clone();
                                 let mut picker = self.image_picker.take();
-                                self.ws_mut().preview.load(&path, picker.as_mut());
+                                self.ws_mut().preview.load(&path, picker.as_mut(), Some(&boundary));
                                 self.image_picker = picker;
                             }
                         }

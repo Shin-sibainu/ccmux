@@ -59,9 +59,45 @@ impl Preview {
     }
 
     /// Load a file for preview.
-    pub fn load(&mut self, path: &Path, picker: Option<&mut Picker>) {
+    ///
+    /// When `boundary` is `Some`, the resolved (canonicalized) path must
+    /// reside under the given directory. This prevents symlink-based
+    /// traversal attacks where a file inside the workspace is replaced
+    /// with a symlink pointing outside `initial_cwd`.
+    pub fn load(&mut self, path: &Path, picker: Option<&mut Picker>, boundary: Option<&Path>) {
         if self.file_path.as_deref() == Some(path) {
             return;
+        }
+
+        // Security: resolve symlinks and verify the real path is within the
+        // workspace boundary. canonicalize() follows symlinks, so a symlink
+        // pointing outside the boundary will be correctly rejected.
+        if let Some(boundary) = boundary {
+            match path.canonicalize() {
+                Ok(real_path) => {
+                    if !real_path.starts_with(boundary) {
+                        self.file_path = Some(path.to_path_buf());
+                        self.scroll_offset = 0;
+                        self.h_scroll_offset = 0;
+                        self.lines = vec!["セキュリティ: ワークスペース外のファイルは表示できません".to_string()];
+                        self.highlighted_lines.clear();
+                        self.is_binary = false;
+                        self.image_protocol = None;
+                        return;
+                    }
+                }
+                Err(_) => {
+                    // Cannot resolve the path (dangling symlink, permission error, etc.)
+                    self.file_path = Some(path.to_path_buf());
+                    self.scroll_offset = 0;
+                    self.h_scroll_offset = 0;
+                    self.lines = vec!["ファイルを読み込めませんでした".to_string()];
+                    self.highlighted_lines.clear();
+                    self.is_binary = false;
+                    self.image_protocol = None;
+                    return;
+                }
+            }
         }
 
         self.file_path = Some(path.to_path_buf());
@@ -285,7 +321,7 @@ mod tests {
     #[test]
     fn test_preview_load_text_file() {
         let mut preview = Preview::new();
-        preview.load(Path::new("Cargo.toml"), None);
+        preview.load(Path::new("Cargo.toml"), None, None);
         assert!(preview.is_active());
         assert!(!preview.is_binary);
         assert!(!preview.lines.is_empty());
@@ -295,7 +331,7 @@ mod tests {
     #[test]
     fn test_preview_close() {
         let mut preview = Preview::new();
-        preview.load(Path::new("Cargo.toml"), None);
+        preview.load(Path::new("Cargo.toml"), None, None);
         assert!(preview.is_active());
 
         preview.close();
@@ -319,7 +355,7 @@ mod tests {
     #[test]
     fn test_preview_highlight_rust() {
         let mut preview = Preview::new();
-        preview.load(Path::new("src/main.rs"), None);
+        preview.load(Path::new("src/main.rs"), None, None);
         assert!(!preview.highlighted_lines.is_empty());
         // Highlighted lines should have colored spans
         let first = &preview.highlighted_lines[0];
