@@ -220,10 +220,16 @@ impl Pane {
     }
 
     /// Check if Claude Code is running in this pane (by window title).
+    ///
+    /// Claude Code sets its terminal title to "Claude Code" or
+    /// "Claude Code - <project>".  We require the title to start with
+    /// "claude code" (case-insensitive) so that a rogue process simply
+    /// including the word "claude" somewhere in its title cannot spoof
+    /// the detection.
     pub fn is_claude_running(&self) -> bool {
         if let Ok(t) = self.title.lock() {
             let lower = t.to_lowercase();
-            lower.contains("claude")
+            lower.starts_with("claude code")
         } else {
             false
         }
