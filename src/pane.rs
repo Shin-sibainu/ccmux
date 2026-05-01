@@ -175,6 +175,16 @@ impl Pane {
         Ok(true)
     }
 
+    /// Visible row count of this pane (matches the inner area height).
+    pub fn rows(&self) -> u16 {
+        self.last_rows
+    }
+
+    /// Visible column count of this pane.
+    pub fn cols(&self) -> u16 {
+        self.last_cols
+    }
+
     /// Scroll the terminal view up (into scrollback history).
     pub fn scroll_up(&self, lines: usize) {
         let mut parser = self.parser.lock().unwrap_or_else(|e| e.into_inner());

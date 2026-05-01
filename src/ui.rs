@@ -509,6 +509,10 @@ fn render_terminal_content(
 
     let rows = area.height as usize;
     let cols = area.width as usize;
+    // Pane selection is stored as `lines_from_bottom` (abs scrollback
+    // offset). Convert each screen row to that coordinate so the
+    // overlay tracks the same content even after auto-scrolling.
+    let current_scrollback = screen.scrollback() as u32;
     let buf = frame.buffer_mut();
 
     for row in 0..rows {
@@ -535,10 +539,14 @@ fn render_terminal_content(
                     Style::default().fg(fg).bg(bg).add_modifier(modifiers)
                 };
 
-                // Apply selection highlight (only if dragged, not single click)
+                // Apply selection highlight (only if dragged, not single click).
+                // For pane selections, `row` is screen-relative — translate to
+                // `lines_from_bottom` for the contains() lookup.
+                let abs_offset = current_scrollback
+                    + (rows as u32).saturating_sub(1).saturating_sub(row as u32);
                 let has_selection = selection.map_or(false, |s| {
                     let (sr, sc, er, ec) = s.normalized();
-                    (sr != er || sc != ec) && s.contains(row as u32, col as u32)
+                    (sr != er || sc != ec) && s.contains(abs_offset, col as u32)
                 });
                 let final_style = if has_selection {
                     Style::default()
