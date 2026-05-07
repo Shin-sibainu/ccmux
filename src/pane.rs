@@ -219,6 +219,24 @@ impl Pane {
         parser.screen().bracketed_paste()
     }
 
+    /// Check if the PTY application is using the alternate screen buffer
+    /// (e.g. Claude Code, vim, htop).  Apps in altbuf typically handle
+    /// scrolling internally, so wheel events should be forwarded to the
+    /// PTY instead of consumed by ccmux's scrollback.
+    pub fn is_alternate_screen(&self) -> bool {
+        let parser = self.parser.lock().unwrap_or_else(|e| e.into_inner());
+        parser.screen().alternate_screen()
+    }
+
+    /// Check if the PTY application has mouse capture enabled.
+    pub fn is_mouse_capture_enabled(&self) -> bool {
+        let parser = self.parser.lock().unwrap_or_else(|e| e.into_inner());
+        !matches!(
+            parser.screen().mouse_protocol_mode(),
+            vt100::MouseProtocolMode::None
+        )
+    }
+
     /// Check if Claude Code is running in this pane (by window title).
     ///
     /// Claude Code sets its terminal title to "Claude Code" or

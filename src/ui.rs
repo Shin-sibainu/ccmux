@@ -576,11 +576,14 @@ fn render_terminal_content(
         }
     }
 
+    let in_altbuf = parser.screen().alternate_screen();
     drop(parser); // release lock before scrollbar_info
 
-    // Scrollbar on the right edge
+    // Scrollbar on the right edge.  Hidden while the app is in the
+    // alternate screen buffer because vt100 has no scrollback for that
+    // screen — the wheel is forwarded to the inner app instead.
     let (scroll_offset, total_lines) = pane.scrollbar_info();
-    if total_lines > rows {
+    if !in_altbuf && total_lines > rows {
         let scrollbar_x = area.x + area.width - 1;
         let max_scroll = total_lines.saturating_sub(rows);
         let visible_ratio = rows as f32 / total_lines as f32;

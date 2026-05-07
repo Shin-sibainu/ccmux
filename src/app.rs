@@ -33,6 +33,30 @@ pub fn strip_bracket_paste_sequences(input: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Encode a mouse wheel event for forwarding to a PTY application that is
+/// using the alternate screen buffer.  When the inner app has mouse capture
+/// enabled we send an SGR mouse report (`\x1b[<64;col;rowM` for wheel up,
+/// `<65` for wheel down).  Otherwise we fall back to the xterm "alternate
+/// scroll" convention of translating wheel events into Up/Down arrow keys,
+/// which works for less, vim, and most pagers.
+pub fn encode_wheel_event(up: bool, col_in_pane: u16, row_in_pane: u16, mouse_capture: bool) -> Vec<u8> {
+    if mouse_capture {
+        let button = if up { 64 } else { 65 };
+        // SGR coordinates are 1-based.
+        format!(
+            "\x1b[<{};{};{}M",
+            button,
+            col_in_pane.saturating_add(1),
+            row_in_pane.saturating_add(1)
+        )
+        .into_bytes()
+    } else if up {
+        b"\x1b[A".to_vec()
+    } else {
+        b"\x1b[B".to_vec()
+    }
+}
+
 /// Events dispatched within the app.
 pub enum AppEvent {
     /// PTY output received for a pane.
@@ -1534,7 +1558,19 @@ impl App {
                     if col >= rect.x && col < rect.x + rect.width
                         && row >= rect.y && row < rect.y + rect.height
                     {
-                        if let Some(pane) = self.ws().panes.get(&pane_id) {
+                        let (altbuf, mouse_cap) = self
+                            .ws()
+                            .panes
+                            .get(&pane_id)
+                            .map(|p| (p.is_alternate_screen(), p.is_mouse_capture_enabled()))
+                            .unwrap_or((false, false));
+                        if altbuf {
+                            let bytes =
+                                encode_wheel_event(true, col - rect.x, row - rect.y, mouse_cap);
+                            if let Some(pane) = self.ws_mut().panes.get_mut(&pane_id) {
+                                let _ = pane.write_input(&bytes);
+                            }
+                        } else if let Some(pane) = self.ws().panes.get(&pane_id) {
                             pane.scroll_up(3);
                         }
                         return;
@@ -1566,7 +1602,19 @@ impl App {
                     if col >= rect.x && col < rect.x + rect.width
                         && row >= rect.y && row < rect.y + rect.height
                     {
-                        if let Some(pane) = self.ws().panes.get(&pane_id) {
+                        let (altbuf, mouse_cap) = self
+                            .ws()
+                            .panes
+                            .get(&pane_id)
+                            .map(|p| (p.is_alternate_screen(), p.is_mouse_capture_enabled()))
+                            .unwrap_or((false, false));
+                        if altbuf {
+                            let bytes =
+                                encode_wheel_event(false, col - rect.x, row - rect.y, mouse_cap);
+                            if let Some(pane) = self.ws_mut().panes.get_mut(&pane_id) {
+                                let _ = pane.write_input(&bytes);
+                            }
+                        } else if let Some(pane) = self.ws().panes.get(&pane_id) {
                             pane.scroll_down(3);
                         }
                         return;
