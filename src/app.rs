@@ -267,8 +267,12 @@ pub enum SelectionTarget {
 /// source to read.
 ///
 /// Coordinate semantics differ by target:
-/// - **Pane**: start/end rows+cols are screen-relative to
-///   `content_rect` (the inner area of the pane border).
+/// - **Pane**: rows are stored as **absolute scrollback offset**
+///   (`lines_from_bottom`) so the selection survives mouse-driven
+///   auto-scroll during drag. `lines_from_bottom = scrollback +
+///   (visible_rows - 1 - screen_row)`. Larger values = older
+///   content = higher visually. Cols are screen-relative within
+///   `content_rect`.
 /// - **Preview**: rows are **absolute line indices** into
 ///   `preview.lines`; cols are **char offsets** within the line.
 ///   This lets the selection survive vertical and horizontal
@@ -288,33 +292,80 @@ pub struct TextSelection {
 }
 
 impl TextSelection {
-    /// Get normalized (top-left to bottom-right) selection range.
+    /// Get visual bounds of the selection: (top_row, top_col, bottom_row, bottom_col)
+    /// where "top" is visually higher (smaller screen y).
+    ///
+    /// Coord semantics depend on target:
+    /// - **Pane**: row is `lines_from_bottom` (abs scrollback offset).
+    ///   Visual top = LARGER row (older content). So top_row >= bottom_row.
+    /// - **Preview**: row is absolute line index. Visual top = SMALLER row.
+    ///   So top_row <= bottom_row.
     pub fn normalized(&self) -> (u32, u32, u32, u32) {
-        if self.start_row < self.end_row
-            || (self.start_row == self.end_row && self.start_col <= self.end_col)
-        {
-            (self.start_row, self.start_col, self.end_row, self.end_col)
-        } else {
-            (self.end_row, self.end_col, self.start_row, self.start_col)
+        match self.target {
+            SelectionTarget::Pane(_) => {
+                // Pane: larger row = visual top.
+                // We want (visual_top_row, visual_top_col, visual_bottom_row, visual_bottom_col).
+                if self.start_row > self.end_row
+                    || (self.start_row == self.end_row && self.start_col <= self.end_col)
+                {
+                    (self.start_row, self.start_col, self.end_row, self.end_col)
+                } else {
+                    (self.end_row, self.end_col, self.start_row, self.start_col)
+                }
+            }
+            SelectionTarget::Preview => {
+                // Preview: smaller row = visual top.
+                if self.start_row < self.end_row
+                    || (self.start_row == self.end_row && self.start_col <= self.end_col)
+                {
+                    (self.start_row, self.start_col, self.end_row, self.end_col)
+                } else {
+                    (self.end_row, self.end_col, self.start_row, self.start_col)
+                }
+            }
         }
     }
 
-    /// Check if a cell is within the selection.
+    /// Check if a cell (row, col) is within the selection.
+    /// `row` semantics depend on target — caller must convert before passing:
+    /// - Pane: pass `lines_from_bottom` for the cell at the current scrollback.
+    /// - Preview: pass the absolute line index.
     pub fn contains(&self, row: u32, col: u32) -> bool {
-        let (sr, sc, er, ec) = self.normalized();
-        if row < sr || row > er {
-            return false;
+        let (top_row, top_col, bot_row, bot_col) = self.normalized();
+        match self.target {
+            SelectionTarget::Pane(_) => {
+                // top_row >= bot_row (larger lines_from_bottom = visually higher)
+                if row > top_row || row < bot_row {
+                    return false;
+                }
+                if top_row == bot_row {
+                    return col >= top_col.min(bot_col) && col <= top_col.max(bot_col);
+                }
+                if row == top_row {
+                    return col >= top_col;
+                }
+                if row == bot_row {
+                    return col <= bot_col;
+                }
+                true
+            }
+            SelectionTarget::Preview => {
+                // top_row <= bot_row (smaller idx = visually higher)
+                if row < top_row || row > bot_row {
+                    return false;
+                }
+                if top_row == bot_row {
+                    return col >= top_col.min(bot_col) && col <= top_col.max(bot_col);
+                }
+                if row == top_row {
+                    return col >= top_col;
+                }
+                if row == bot_row {
+                    return col <= bot_col;
+                }
+                true
+            }
         }
-        if row == sr && row == er {
-            return col >= sc && col <= ec;
-        }
-        if row == sr {
-            return col >= sc;
-        }
-        if row == er {
-            return col <= ec;
-        }
-        true
     }
 }
 
@@ -1383,14 +1434,64 @@ impl App {
                 if let Some(ref mut sel) = self.selection {
                     let inner = sel.content_rect;
                     match sel.target {
-                        SelectionTarget::Pane(_) => {
-                            // Pane: screen-relative coords inside inner.
-                            sel.end_col = col
+                        SelectionTarget::Pane(pane_id) => {
+                            // Pane: rows are stored as `lines_from_bottom`
+                            // (abs scrollback offset) so selection survives
+                            // auto-scroll. When the mouse is at the top or
+                            // bottom edge of the pane content area, scroll
+                            // the underlying buffer one line so more content
+                            // can pull into the selection.
+                            //
+                            // Important: don't touch `sel` after this point —
+                            // the inner blocks need to borrow `self` for
+                            // pane lookup / scrolling, which conflicts with
+                            // the outer `&mut sel`. We re-acquire the
+                            // selection via `self.selection.as_mut()` at the
+                            // end, mirroring the Preview branch.
+                            let inner_h = inner.height as u32;
+                            let inner_w = inner.width as u32;
+
+                            let mut screen_row: u32 = row
+                                .saturating_sub(inner.y) as u32;
+                            if row < inner.y {
+                                if let Some(p) = self.ws().panes.get(&pane_id) {
+                                    p.scroll_up(1);
+                                }
+                                screen_row = 0;
+                            } else if row >= inner.y + inner.height {
+                                if let Some(p) = self.ws().panes.get(&pane_id) {
+                                    p.scroll_down(1);
+                                }
+                                screen_row = inner_h.saturating_sub(1);
+                            } else {
+                                screen_row = screen_row.min(inner_h.saturating_sub(1));
+                            }
+
+                            let screen_col: u32 = col
                                 .saturating_sub(inner.x)
                                 .min(inner.width.saturating_sub(1)) as u32;
-                            sel.end_row = row
-                                .saturating_sub(inner.y)
-                                .min(inner.height.saturating_sub(1)) as u32;
+
+                            // Read CURRENT scrollback (may have just changed).
+                            let cur_scrollback = self
+                                .ws()
+                                .panes
+                                .get(&pane_id)
+                                .map(|p| {
+                                    p.parser
+                                        .lock()
+                                        .map(|g| g.screen().scrollback() as u32)
+                                        .unwrap_or(0)
+                                })
+                                .unwrap_or(0);
+
+                            let abs_offset = cur_scrollback
+                                + inner_h.saturating_sub(1).saturating_sub(screen_row);
+                            let final_col = screen_col.min(inner_w.saturating_sub(1));
+
+                            if let Some(sel) = self.selection.as_mut() {
+                                sel.end_row = abs_offset;
+                                sel.end_col = final_col;
+                            }
                         }
                         SelectionTarget::Preview => {
                             // Preview: translate screen coords to
@@ -1450,13 +1551,29 @@ impl App {
                                 rect.width.saturating_sub(2),
                                 rect.height.saturating_sub(2),
                             );
+                            // Convert screen coords to `lines_from_bottom`
+                            // so the selection survives auto-scroll.
                             let cell_col = col.saturating_sub(inner.x) as u32;
-                            let cell_row = row.saturating_sub(inner.y) as u32;
+                            let screen_row = row.saturating_sub(inner.y) as u32;
+                            let inner_h = inner.height as u32;
+                            let cur_scrollback = self
+                                .ws()
+                                .panes
+                                .get(&pane_id)
+                                .map(|p| {
+                                    p.parser
+                                        .lock()
+                                        .map(|g| g.screen().scrollback() as u32)
+                                        .unwrap_or(0)
+                                })
+                                .unwrap_or(0);
+                            let abs_offset = cur_scrollback
+                                + inner_h.saturating_sub(1).saturating_sub(screen_row);
                             self.selection = Some(TextSelection {
                                 target: SelectionTarget::Pane(pane_id),
-                                start_row: cell_row,
+                                start_row: abs_offset,
                                 start_col: cell_col,
-                                end_row: cell_row,
+                                end_row: abs_offset,
                                 end_col: cell_col,
                                 content_rect: inner,
                             });
@@ -1772,18 +1889,50 @@ fn dir_name(path: &std::path::Path) -> String {
 }
 
 /// Extract text from a pane's vt100 screen within a selection range.
+/// Extract selected text from a pane.
+///
+/// `sr`/`er` are `lines_from_bottom` values (abs scrollback offsets):
+///   `sr` = visual top row = LARGER offset (older content)
+///   `er` = visual bottom row = SMALLER offset (newer content)
+/// `sc`/`ec` are screen-relative column indices at those rows.
+///
+/// To read content at a given `lines_from_bottom = N`, we set the
+/// pane's scrollback to N — that places the line at the bottom row
+/// of the visible area (row index `rows-1`) where we can read it via
+/// `screen.cell(row, col)`. We restore the original scrollback when
+/// done so we don't disturb the user's view.
 fn extract_selected_text(pane: &Pane, sr: u32, sc: u32, er: u32, ec: u32) -> String {
-    let parser = pane.parser.lock().unwrap_or_else(|e| e.into_inner());
-    let screen = parser.screen();
+    let mut parser = pane.parser.lock().unwrap_or_else(|e| e.into_inner());
+    let original_scrollback = parser.screen().scrollback();
+    let rows = pane.rows() as u32;
+    let cols = pane.cols() as u32;
+
+    if rows == 0 || cols == 0 {
+        return String::new();
+    }
+    let bottom_row_idx = (rows - 1) as u16;
+
+    // Visual top has LARGER offset; visual bottom has SMALLER offset.
+    // Iterate top→bottom by stepping offset from large to small.
+    let top_offset = sr.max(er);
+    let bottom_offset = sr.min(er);
+
     let mut lines = Vec::new();
+    for offset in (bottom_offset..=top_offset).rev() {
+        parser.screen_mut().set_scrollback(offset as usize);
+        let screen = parser.screen();
 
-    for row in sr..=er {
+        let col_start = if offset == top_offset { sc } else { 0 };
+        let col_end_inclusive = if offset == bottom_offset {
+            ec
+        } else {
+            cols.saturating_sub(1)
+        };
+
         let mut line = String::new();
-        let col_start = if row == sr { sc } else { 0 };
-        let col_end = if row == er { ec } else { 999 };
-
-        for col in col_start..=col_end {
-            if let Some(cell) = screen.cell(row as u16, col as u16) {
+        let mut c = col_start;
+        while c <= col_end_inclusive && c < cols {
+            if let Some(cell) = screen.cell(bottom_row_idx, c as u16) {
                 let contents = cell.contents();
                 if contents.is_empty() {
                     line.push(' ');
@@ -1791,9 +1940,13 @@ fn extract_selected_text(pane: &Pane, sr: u32, sc: u32, er: u32, ec: u32) -> Str
                     line.push_str(contents);
                 }
             }
+            c += 1;
         }
         lines.push(line.trim_end().to_string());
     }
+
+    // Restore the user's original view position.
+    parser.screen_mut().set_scrollback(original_scrollback);
 
     // Remove trailing empty lines
     while lines.last().map_or(false, |l| l.is_empty()) {
