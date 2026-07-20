@@ -239,15 +239,10 @@ impl Pane {
 
     /// Check if Claude Code is running in this pane (by window title).
     ///
-    /// Claude Code sets its terminal title to "Claude Code" or
-    /// "Claude Code - <project>".  We require the title to start with
-    /// "claude code" (case-insensitive) so that a rogue process simply
-    /// including the word "claude" somewhere in its title cannot spoof
-    /// the detection.
+    /// See `title_indicates_claude` for the accepted title formats.
     pub fn is_claude_running(&self) -> bool {
         if let Ok(t) = self.title.lock() {
-            let lower = t.to_lowercase();
-            lower.starts_with("claude code")
+            title_indicates_claude(&t)
         } else {
             false
         }
@@ -367,6 +362,39 @@ fn extract_osc7(data: &[u8]) -> Option<PathBuf> {
     None
 }
 
+/// Check whether a window title indicates Claude Code is running.
+///
+/// Observed title formats across Claude Code versions:
+/// - `Claude Code` / `Claude Code - <project>` (~v2.1.1xx)
+/// - `claude` — set at process startup (v2.1.140+, issue #15)
+/// - `✳ Claude Code` / `· Claude Code` / `* Claude Code` — spinner glyph +
+///   title while the interactive UI is running (v2.1.2xx; the glyph rotates
+///   through `· ✢ * ✳ ✶ ✻ ✽` while working)
+/// - `claude · resume` — session resume picker
+///
+/// A leading run of non-alphanumeric characters (the spinner glyph and
+/// whitespace) is stripped, then the title must be exactly "claude" or start
+/// with "claude code" / "claude · " (case-insensitive).  We deliberately do
+/// NOT match a title that merely *contains* "claude" somewhere, so a process
+/// that happens to have the word in its title (e.g. an editor opening
+/// claude.md) does not trigger the detection (battle-log round 6).
+///
+/// Accepting the bare title "claude" is a deliberate, minimal relaxation of
+/// the round-6 rule — required because v2.1.140+ emits exactly that at
+/// startup.  It is an exact match (not a prefix), and the detection only
+/// drives UI decoration (border color, cursor, status bar), not a security
+/// boundary.
+fn title_indicates_claude(title: &str) -> bool {
+    let lower = title.to_lowercase();
+    // `char::is_alphanumeric` is Unicode-aware: CJK and other letters are NOT
+    // stripped, only symbols/punctuation/whitespace, so e.g. "実行中 claude"
+    // does not sneak past the prefix check.
+    let stripped = lower.trim_start_matches(|c: char| !c.is_alphanumeric());
+    stripped == "claude"
+        || stripped.starts_with("claude code")
+        || stripped.starts_with("claude \u{b7} ")
+}
+
 /// Extract window title from OSC 0 or OSC 2: \x1b]0;TITLE\x07 or \x1b]2;TITLE\x07
 fn extract_osc_title(data: &[u8]) -> Option<String> {
     let s = std::str::from_utf8(data).ok()?;
@@ -445,6 +473,48 @@ fn detect_shell_unix() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_title_indicates_claude_legacy_formats() {
+        // <= v2.1.1xx
+        assert!(title_indicates_claude("Claude Code"));
+        assert!(title_indicates_claude("Claude Code - myproject"));
+        assert!(title_indicates_claude("Claude Code v2.1.104"));
+    }
+
+    #[test]
+    fn test_title_indicates_claude_bare_claude() {
+        // v2.1.140+ sets the title to just "claude" at startup (issue #15)
+        assert!(title_indicates_claude("claude"));
+        assert!(title_indicates_claude("Claude"));
+    }
+
+    #[test]
+    fn test_title_indicates_claude_spinner_prefix() {
+        // v2.1.2xx: "<spinner glyph> <title>" while the UI is running
+        assert!(title_indicates_claude("✳ Claude Code"));
+        assert!(title_indicates_claude("· Claude Code"));
+        assert!(title_indicates_claude("* Claude Code"));
+        assert!(title_indicates_claude("✻ Claude Code"));
+    }
+
+    #[test]
+    fn test_title_indicates_claude_resume_picker() {
+        assert!(title_indicates_claude("claude · resume"));
+    }
+
+    #[test]
+    fn test_title_indicates_claude_rejects_incidental_matches() {
+        assert!(!title_indicates_claude(""));
+        assert!(!title_indicates_claude("bash"));
+        assert!(!title_indicates_claude("MINGW64:/c/Users/foo"));
+        // "claude" appearing mid-title must not match (battle-log round 6)
+        assert!(!title_indicates_claude("claude.md - VIM"));
+        assert!(!title_indicates_claude("my claude code notes"));
+        assert!(!title_indicates_claude("claudette"));
+        // Leading CJK text is not a spinner glyph and must not be stripped
+        assert!(!title_indicates_claude("実行中 claude"));
+    }
 
     #[test]
     fn test_detect_shell_returns_valid_path() {
