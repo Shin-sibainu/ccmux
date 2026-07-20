@@ -1774,7 +1774,14 @@ fn dir_name(path: &std::path::Path) -> String {
 /// Extract text from a pane's vt100 screen within a selection range.
 fn extract_selected_text(pane: &Pane, sr: u32, sc: u32, er: u32, ec: u32) -> String {
     let parser = pane.parser.lock().unwrap_or_else(|e| e.into_inner());
-    let screen = parser.screen();
+    extract_screen_text(parser.screen(), sr, sc, er, ec)
+}
+
+/// Extract text from a vt100 screen within an inclusive cell range
+/// (`sr`/`sc` .. `er`/`ec`). Wide-character continuation cells are skipped;
+/// genuinely blank cells become spaces. Lines are right-trimmed and trailing
+/// empty lines removed.
+fn extract_screen_text(screen: &vt100::Screen, sr: u32, sc: u32, er: u32, ec: u32) -> String {
     let mut lines = Vec::new();
 
     for row in sr..=er {
@@ -1784,6 +1791,13 @@ fn extract_selected_text(pane: &Pane, sr: u32, sc: u32, er: u32, ec: u32) -> Str
 
         for col in col_start..=col_end {
             if let Some(cell) = screen.cell(row as u16, col as u16) {
+                // A wide character (e.g. CJK) occupies two cells: the first
+                // holds the character, the second is an empty continuation
+                // cell. Skip continuation cells so they are not mistaken for
+                // blank cells ("日本語" must not become "日 本 語").
+                if cell.is_wide_continuation() {
+                    continue;
+                }
                 let contents = cell.contents();
                 if contents.is_empty() {
                     line.push(' ');
@@ -1908,6 +1922,64 @@ fn key_event_to_bytes(key: &KeyEvent) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build a vt100 screen by feeding raw bytes to a fresh parser.
+    fn screen_with(data: &[u8]) -> vt100::Parser {
+        let mut parser = vt100::Parser::new(24, 80, 0);
+        parser.process(data);
+        parser
+    }
+
+    #[test]
+    fn test_extract_screen_text_wide_chars_no_extra_spaces() {
+        // Wide (CJK) chars occupy two cells; the continuation cell must not
+        // be extracted as a space.
+        let parser = screen_with("日本語".as_bytes());
+        assert_eq!(extract_screen_text(parser.screen(), 0, 0, 0, 20), "日本語");
+    }
+
+    #[test]
+    fn test_extract_screen_text_mixed_ascii_and_wide() {
+        let parser = screen_with("abc 日本語 def".as_bytes());
+        assert_eq!(
+            extract_screen_text(parser.screen(), 0, 0, 0, 30),
+            "abc 日本語 def"
+        );
+    }
+
+    #[test]
+    fn test_extract_screen_text_ascii_preserves_inner_blanks() {
+        // Genuine blank cells inside the selection must still come out as
+        // spaces (cursor positioned past unwritten cells).
+        let parser = screen_with(b"ab\x1b[1;6Hcd");
+        assert_eq!(extract_screen_text(parser.screen(), 0, 0, 0, 10), "ab   cd");
+    }
+
+    #[test]
+    fn test_extract_screen_text_selection_starts_on_continuation_cell() {
+        // "日" occupies cells 0-1. Starting the selection on the continuation
+        // cell (col 1) drops the character entirely — no stray space or half
+        // character.
+        let parser = screen_with("日本".as_bytes());
+        assert_eq!(extract_screen_text(parser.screen(), 0, 1, 0, 10), "本");
+    }
+
+    #[test]
+    fn test_extract_screen_text_selection_ends_on_wide_first_cell() {
+        // "本" starts at cell 2; ending the selection exactly there must
+        // include the full character.
+        let parser = screen_with("日本語".as_bytes());
+        assert_eq!(extract_screen_text(parser.screen(), 0, 0, 0, 2), "日本");
+    }
+
+    #[test]
+    fn test_extract_screen_text_multiline_wide() {
+        let parser = screen_with("一行目\r\n二行目".as_bytes());
+        assert_eq!(
+            extract_screen_text(parser.screen(), 0, 0, 1, 20),
+            "一行目\n二行目"
+        );
+    }
 
     #[test]
     fn test_layout_single_pane() {
