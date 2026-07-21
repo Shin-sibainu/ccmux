@@ -4,7 +4,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, BorderType, Paragraph};
 use ratatui::Frame;
 
-use crate::app::{App, DragTarget, FocusTarget};
+use crate::app::{App, DragTarget, FocusTarget, MIN_PANE_AREA_WIDTH};
 
 // ─── Theme (Claude-inspired) ──────────────────────────────
 const BG: Color = Color::Rgb(0x0d, 0x11, 0x17);
@@ -24,7 +24,6 @@ const SCROLL_BG: Color = Color::Rgb(0x2a, 0x1f, 0x14);
 
 const MIN_TERMINAL_WIDTH: u16 = 40;
 const MIN_TERMINAL_HEIGHT: u16 = 10;
-const MIN_PANE_AREA_WIDTH: u16 = 20;
 
 // ─── File type icons ──────────────────────────────────────
 fn file_icon(name: &str) -> (&'static str, Color) {
