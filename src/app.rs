@@ -91,6 +91,29 @@ pub enum DragTarget {
     Scrollbar(usize, Rect), // pane_id, inner area
 }
 
+// ─── Layout widths ────────────────────────────────────────
+
+/// Minimum width the pane area must keep when sidebars grow.
+/// Shared by ui::render_main_area and relayout_panes so the painted
+/// layout and the PTY sizes never drift apart.
+pub(crate) const MIN_PANE_AREA_WIDTH: u16 = 20;
+/// Minimum file tree width when dragging its border.
+const MIN_FILE_TREE_WIDTH: u16 = 10;
+/// Minimum preview width when dragging its border.
+const MIN_PREVIEW_WIDTH: u16 = 15;
+
+/// Dynamic upper bound for a side panel (file tree / preview) width:
+/// the terminal width minus the pane area's minimum and the other
+/// side panel's width (0 when it is not painted). Always returns at
+/// least `min` so callers can use it as `clamp(min, max)` without
+/// risking the min > max panic.
+fn max_side_panel_width(term_w: u16, other_panel_w: u16, min: u16) -> u16 {
+    term_w
+        .saturating_sub(MIN_PANE_AREA_WIDTH)
+        .saturating_sub(other_panel_w)
+        .max(min)
+}
+
 // ─── Layout Tree ──────────────────────────────────────────
 
 /// Binary tree node for pane layout.
@@ -530,7 +553,6 @@ impl App {
         // including the fallback where tree / preview are hidden when
         // the terminal is too narrow. Keeping these in sync prevents
         // PTY size drift from the actually-painted pane size.
-        const MIN_PANE_AREA_WIDTH: u16 = 20;
         let tab_h = 1u16;
         let status_h: u16 = if self.status_bar_visible || self.rename_input.is_some() { 1 } else { 0 };
         let main_h = rows.saturating_sub(tab_h + status_h);
@@ -600,6 +622,21 @@ impl App {
     pub fn on_terminal_resize(&mut self, cols: u16, rows: u16) {
         self.last_term_size = (cols, rows);
         self.mark_layout_change();
+    }
+
+    /// Dynamic drag limit for the file tree width. The other panel's
+    /// width is only reserved when it is actually painted (rect-based),
+    /// so a preview hidden by the narrow-terminal fallback doesn't
+    /// shrink the limit.
+    fn max_file_tree_width(&self) -> u16 {
+        let preview_w = if self.ws().last_preview_rect.is_some() { self.preview_width } else { 0 };
+        max_side_panel_width(self.last_term_size.0, preview_w, MIN_FILE_TREE_WIDTH)
+    }
+
+    /// Dynamic drag limit for the preview width (see max_file_tree_width).
+    fn max_preview_width(&self) -> u16 {
+        let tree_w = if self.ws().last_file_tree_rect.is_some() { self.file_tree_width } else { 0 };
+        max_side_panel_width(self.last_term_size.0, tree_w, MIN_PREVIEW_WIDTH)
     }
 
     /// Get the active workspace.
@@ -1347,18 +1384,18 @@ impl App {
                 if let Some(ref target) = self.dragging.clone() {
                     match target {
                         DragTarget::FileTreeBorder => {
-                            self.file_tree_width = col.clamp(10, 60);
+                            self.file_tree_width = col.clamp(MIN_FILE_TREE_WIDTH, self.max_file_tree_width());
                         }
                         DragTarget::PreviewBorder => {
                             if let Some(rect) = self.ws().last_preview_rect {
-                                if self.layout_swapped {
-                                    let new_width = col.saturating_sub(rect.x).clamp(15, 80);
-                                    self.preview_width = new_width;
+                                let max = self.max_preview_width();
+                                let new_width = if self.layout_swapped {
+                                    col.saturating_sub(rect.x)
                                 } else {
                                     let total_right = rect.x + rect.width;
-                                    let new_width = total_right.saturating_sub(col).clamp(15, 80);
-                                    self.preview_width = new_width;
-                                }
+                                    total_right.saturating_sub(col)
+                                };
+                                self.preview_width = new_width.clamp(MIN_PREVIEW_WIDTH, max);
                             }
                         }
                         DragTarget::PaneSplit(path, direction, area) => {
@@ -1908,6 +1945,46 @@ fn key_event_to_bytes(key: &KeyEvent) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_max_side_panel_width_wide_screen() {
+        // 200 cols, other panel 40 wide: 200 - 20 (pane min) - 40 = 140.
+        assert_eq!(max_side_panel_width(200, 40, 10), 140);
+    }
+
+    #[test]
+    fn test_max_side_panel_width_other_hidden() {
+        // Other panel not painted (0): its width is not reserved.
+        assert_eq!(max_side_panel_width(200, 0, 10), 180);
+    }
+
+    #[test]
+    fn test_max_side_panel_width_preview_symmetry() {
+        // Preview side uses the same formula with its own min (15):
+        // 120 - 20 (pane min) - 20 (tree) = 80.
+        assert_eq!(max_side_panel_width(120, 20, 15), 80);
+    }
+
+    #[test]
+    fn test_max_side_panel_width_exact_boundary() {
+        // 70 - 20 - 40 = 10 == min: no degradation yet.
+        assert_eq!(max_side_panel_width(70, 40, 10), 10);
+    }
+
+    #[test]
+    fn test_max_side_panel_width_degenerate_clamps_to_min() {
+        // 40 - 20 - 40 saturates to 0, which must be lifted to min so
+        // clamp(min, max) never sees min > max (that would panic).
+        let max = max_side_panel_width(40, 40, 10);
+        assert_eq!(max, 10);
+        assert_eq!(100u16.clamp(10, max), 10);
+    }
+
+    #[test]
+    fn test_max_side_panel_width_zero_term() {
+        // u16 subtraction must not underflow on a zero-sized terminal.
+        assert_eq!(max_side_panel_width(0, 0, 15), 15);
+    }
 
     #[test]
     fn test_layout_single_pane() {
