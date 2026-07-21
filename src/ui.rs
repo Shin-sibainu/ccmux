@@ -562,14 +562,14 @@ fn render_terminal_content(
     let show_cursor = is_focused && (!screen.hide_cursor() || pane.is_claude_running());
     if show_cursor {
         let cursor = screen.cursor_position();
-        // For Claude Code, shift cursor 1 column left because Claude draws its own
-        // block character at the cursor position, and the PTY cursor would otherwise
-        // appear one column after with a visible gap.
-        let cursor_x = if pane.is_claude_running() {
-            area.x + cursor.1.saturating_sub(1)
-        } else {
-            area.x + cursor.1
-        };
+        // Place the hardware cursor at the PTY's reported column. Claude Code
+        // (v2.1.140+) draws no cursor of its own — it relies entirely on the
+        // terminal cursor — so its reported position is already correct, and a
+        // fixed leftward shift (added long ago for a Claude version that drew
+        // its own block) instead landed the cursor on the previous glyph: on a
+        // wide (CJK) character's continuation cell it sat half a full-width
+        // column off. No per-pane special case is needed for the column.
+        let cursor_x = area.x + cursor.1;
         let cursor_y = area.y + cursor.0;
         if cursor_x < area.x + area.width && cursor_y < area.y + area.height {
             frame.set_cursor_position((cursor_x, cursor_y));
