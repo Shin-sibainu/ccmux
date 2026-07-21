@@ -20,7 +20,16 @@ pub struct Pane {
     last_rows: u16,
     last_cols: u16,
     pub exited: bool,
+    /// Current OSC 0/2 window title. The reader thread keeps this up to date
+    /// for OSC tracking / potential future title display; Claude detection no
+    /// longer reads it directly (it derives `claude_active` from title events).
+    #[allow(dead_code)]
     pub title: Arc<Mutex<String>>,
+    /// Whether Claude Code is currently running in this pane. Set by the
+    /// reader thread via title hysteresis (see `pty_reader_thread`): turned
+    /// on by a Claude title, off by a shell prompt title, held across the
+    /// `<spinner> <session-name>` titles in between. Read by the UI.
+    claude_active: Arc<std::sync::atomic::AtomicBool>,
     pub cwd: PathBuf,
     pub total_scrollback: Arc<std::sync::atomic::AtomicUsize>,
 }
@@ -86,10 +95,20 @@ impl Pane {
 
         let parser_clone = Arc::clone(&parser);
         let title_clone = Arc::clone(&pane_title);
+        let claude_active = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let claude_active_clone = Arc::clone(&claude_active);
         let scrollback_counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let scrollback_clone = Arc::clone(&scrollback_counter);
         let reader_handle = thread::spawn(move || {
-            pty_reader_thread(reader, parser_clone, title_clone, scrollback_clone, id, event_tx);
+            pty_reader_thread(
+                reader,
+                parser_clone,
+                title_clone,
+                claude_active_clone,
+                scrollback_clone,
+                id,
+                event_tx,
+            );
         });
 
         let mut pane = Self {
@@ -103,6 +122,7 @@ impl Pane {
             last_cols: cols,
             exited: false,
             title: pane_title,
+            claude_active,
             cwd: work_dir,
             total_scrollback: scrollback_counter,
         };
@@ -237,20 +257,14 @@ impl Pane {
         )
     }
 
-    /// Check if Claude Code is running in this pane (by window title).
+    /// Check if Claude Code is running in this pane.
     ///
-    /// Claude Code sets its terminal title to "Claude Code" or
-    /// "Claude Code - <project>".  We require the title to start with
-    /// "claude code" (case-insensitive) so that a rogue process simply
-    /// including the word "claude" somewhere in its title cannot spoof
-    /// the detection.
+    /// Returns the hysteresis flag maintained by the reader thread rather than
+    /// re-judging the current title: Claude rewrites its title to
+    /// `<spinner> <session-name>` while running, which `title_indicates_claude`
+    /// alone would not recognise. See `pty_reader_thread` for the state machine.
     pub fn is_claude_running(&self) -> bool {
-        if let Ok(t) = self.title.lock() {
-            let lower = t.to_lowercase();
-            lower.starts_with("claude code")
-        } else {
-            false
-        }
+        self.claude_active.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Kill the PTY child process.
@@ -271,6 +285,7 @@ fn pty_reader_thread(
     mut reader: Box<dyn Read + Send>,
     parser: Arc<Mutex<vt100::Parser>>,
     title: Arc<Mutex<String>>,
+    claude_active: Arc<std::sync::atomic::AtomicBool>,
     scrollback_count: Arc<std::sync::atomic::AtomicUsize>,
     pane_id: usize,
     event_tx: Sender<AppEvent>,
@@ -296,8 +311,16 @@ fn pty_reader_thread(
                     let _ = event_tx.send(AppEvent::CwdChanged(pane_id, path));
                 }
 
-                // Detect OSC 0/2 (window title) — used to detect Claude Code
+                // Detect OSC 0/2 (window title) — drives Claude Code detection.
                 if let Some(new_title) = extract_osc_title(data) {
+                    // Hysteresis (see `next_claude_active`): held across the
+                    // `<spinner> <session-name>` titles so a named/continued
+                    // Claude session stays detected.
+                    let prev = claude_active.load(std::sync::atomic::Ordering::Relaxed);
+                    let next = next_claude_active(prev, &new_title);
+                    if next != prev {
+                        claude_active.store(next, std::sync::atomic::Ordering::Relaxed);
+                    }
                     if let Ok(mut t) = title.lock() {
                         *t = new_title;
                     }
@@ -365,6 +388,88 @@ fn extract_osc7(data: &[u8]) -> Option<PathBuf> {
     }
 
     None
+}
+
+/// Check whether a window title indicates Claude Code is running.
+///
+/// Observed title formats across Claude Code versions:
+/// - `Claude Code` / `Claude Code - <project>` (~v2.1.1xx)
+/// - `claude` — set at process startup (v2.1.140+, issue #15)
+/// - `✳ Claude Code` / `· Claude Code` / `* Claude Code` — spinner glyph +
+///   title while the interactive UI is running (v2.1.2xx; the glyph rotates
+///   through `· ✢ * ✳ ✶ ✻ ✽` while working)
+/// - `claude · resume` — session resume picker
+///
+/// A leading run of non-alphanumeric characters (the spinner glyph and
+/// whitespace) is stripped, then the title must be exactly "claude" or start
+/// with "claude code" / "claude · " (case-insensitive).  We deliberately do
+/// NOT match a title that merely *contains* "claude" somewhere, so a process
+/// that happens to have the word in its title (e.g. an editor opening
+/// claude.md) does not trigger the detection (battle-log round 6).
+///
+/// Accepting the bare title "claude" is a deliberate, minimal relaxation of
+/// the round-6 rule — required because v2.1.140+ emits exactly that at
+/// startup.  It is an exact match (not a prefix), and the detection only
+/// drives UI decoration (border color, cursor, status bar), not a security
+/// boundary.
+fn title_indicates_claude(title: &str) -> bool {
+    let lower = title.to_lowercase();
+    // `char::is_alphanumeric` is Unicode-aware: CJK and other letters are NOT
+    // stripped, only symbols/punctuation/whitespace, so e.g. "実行中 claude"
+    // does not sneak past the prefix check.
+    let stripped = lower.trim_start_matches(|c: char| !c.is_alphanumeric());
+    stripped == "claude"
+        || stripped.starts_with("claude code")
+        || stripped.starts_with("claude \u{b7} ")
+}
+
+/// Check whether a window title is a shell prompt title (i.e. Claude Code is
+/// NOT running here).
+///
+/// Used as the OFF trigger of the Claude-detection hysteresis: once a pane has
+/// been marked as running Claude (via [`title_indicates_claude`]), it stays so
+/// even after Claude rewrites its title to `<spinner> <session-name>`, until a
+/// shell prompt title appears — meaning Claude has exited and the shell is back.
+///
+/// Recognised shell titles (case-insensitive):
+/// - `MINGW64:` / `MINGW32:` / `MSYS:` prefixes — Git Bash / MSYS set these via
+///   `PROMPT_COMMAND` (e.g. `MINGW64:/c/Users/foo`).
+/// - a known shell-executable name suffix (`bash.exe` / `powershell.exe` /
+///   `pwsh.exe` / `cmd.exe`) — the PTY's initial title is often the shell exe
+///   path (`C:\Program Files\Git\bin\bash.exe`). Restricted to specific shell
+///   exes so that a Claude session/topic name merely ending in `.exe` (e.g.
+///   `✳ fix build.exe`) is NOT mistaken for a shell prompt.
+///
+/// This is deliberately Git-Bash-centric (ccmux's primary shell). PowerShell /
+/// custom-prompt titles that match neither are a known gap (see design ADR-2).
+fn title_is_shell_prompt(title: &str) -> bool {
+    let lower = title.to_lowercase();
+    lower.starts_with("mingw64:")
+        || lower.starts_with("mingw32:")
+        || lower.starts_with("msys:")
+        || lower.ends_with("bash.exe")
+        || lower.ends_with("powershell.exe")
+        || lower.ends_with("pwsh.exe")
+        || lower.ends_with("cmd.exe")
+}
+
+/// Hysteresis transition for Claude-Code detection, given the current state and
+/// a newly observed window title:
+/// - a Claude title turns it **on** (start of a session);
+/// - a shell prompt title turns it **off** (Claude exited, shell is back);
+/// - anything else (the `<spinner> <session-name>` titles Claude emits while
+///   running, or an unrelated app's title) leaves the state **unchanged**.
+///
+/// Because only a Claude title can turn it on, a pane that has never shown a
+/// Claude title stays off even while displaying a session-name-like title.
+fn next_claude_active(current: bool, new_title: &str) -> bool {
+    if title_indicates_claude(new_title) {
+        true
+    } else if title_is_shell_prompt(new_title) {
+        false
+    } else {
+        current
+    }
 }
 
 /// Extract window title from OSC 0 or OSC 2: \x1b]0;TITLE\x07 or \x1b]2;TITLE\x07
@@ -445,6 +550,123 @@ fn detect_shell_unix() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_title_indicates_claude_legacy_formats() {
+        // <= v2.1.1xx
+        assert!(title_indicates_claude("Claude Code"));
+        assert!(title_indicates_claude("Claude Code - myproject"));
+        assert!(title_indicates_claude("Claude Code v2.1.104"));
+    }
+
+    #[test]
+    fn test_title_indicates_claude_bare_claude() {
+        // v2.1.140+ sets the title to just "claude" at startup (issue #15)
+        assert!(title_indicates_claude("claude"));
+        assert!(title_indicates_claude("Claude"));
+    }
+
+    #[test]
+    fn test_title_indicates_claude_spinner_prefix() {
+        // v2.1.2xx: "<spinner glyph> <title>" while the UI is running
+        assert!(title_indicates_claude("✳ Claude Code"));
+        assert!(title_indicates_claude("· Claude Code"));
+        assert!(title_indicates_claude("* Claude Code"));
+        assert!(title_indicates_claude("✻ Claude Code"));
+    }
+
+    #[test]
+    fn test_title_indicates_claude_resume_picker() {
+        assert!(title_indicates_claude("claude · resume"));
+    }
+
+    #[test]
+    fn test_title_indicates_claude_rejects_incidental_matches() {
+        assert!(!title_indicates_claude(""));
+        assert!(!title_indicates_claude("bash"));
+        assert!(!title_indicates_claude("MINGW64:/c/Users/foo"));
+        // "claude" appearing mid-title must not match (battle-log round 6)
+        assert!(!title_indicates_claude("claude.md - VIM"));
+        assert!(!title_indicates_claude("my claude code notes"));
+        assert!(!title_indicates_claude("claudette"));
+        // Leading CJK text is not a spinner glyph and must not be stripped
+        assert!(!title_indicates_claude("実行中 claude"));
+    }
+
+    #[test]
+    fn test_title_is_shell_prompt_recognises_shell_titles() {
+        // Git Bash / MSYS PROMPT_COMMAND titles
+        assert!(title_is_shell_prompt("MINGW64:/c/Users/foo"));
+        assert!(title_is_shell_prompt("MINGW32:/c/Users/foo"));
+        assert!(title_is_shell_prompt("MSYS:/c/Users/foo"));
+        // Initial PTY title = shell executable path
+        assert!(title_is_shell_prompt("C:\\Program Files\\Git\\bin\\bash.exe"));
+        assert!(title_is_shell_prompt("powershell.exe"));
+        assert!(title_is_shell_prompt("cmd.exe"));
+    }
+
+    #[test]
+    fn test_next_claude_active_hysteresis() {
+        // ON: a Claude title starts detection regardless of prior state.
+        assert!(next_claude_active(false, "claude"));
+        assert!(next_claude_active(false, "✳ Claude Code"));
+        assert!(next_claude_active(true, "claude"));
+
+        // HELD: session-name / spinner titles keep the current state — this is
+        // the core fix (a named/continued session stays detected).
+        assert!(next_claude_active(true, "✳ ccmux-display-optimization"));
+        assert!(next_claude_active(true, "⠂ ccmux-display-optimization"));
+        assert!(next_claude_active(true, "")); // empty title: unchanged
+
+        // OFF: a shell prompt title ends detection (Claude exited).
+        assert!(!next_claude_active(true, "MINGW64:/c/Users/foo"));
+        assert!(!next_claude_active(true, "C:\\Program Files\\Git\\bin\\bash.exe"));
+
+        // Stays OFF: a pane that never showed a Claude title is not turned on
+        // by a session-name-like title (prevents false positives).
+        assert!(!next_claude_active(false, "✳ ccmux-display-optimization"));
+        assert!(!next_claude_active(false, "MINGW64:/c/Users/foo"));
+
+        // HELD across a session/topic name that merely ends in ".exe": only
+        // known shell exes count as shell prompts, so this stays detected.
+        assert!(next_claude_active(true, "✳ fix build.exe"));
+    }
+
+    #[test]
+    fn test_claude_active_full_lifecycle() {
+        // A realistic sequence of title events from pane start through a named
+        // Claude session and back to the shell.
+        let steps: &[(&str, bool)] = &[
+            ("C:\\Program Files\\Git\\bin\\bash.exe", false), // shell spawn
+            ("MINGW64:/c/Users/foo", false),                 // shell prompt
+            ("claude", true),                                // claude starts
+            ("✳ Claude Code", true),                         // UI up (unnamed)
+            ("✳ my-session", true),                          // renamed: held
+            ("⠂ my-session", true),                          // spinner: held
+            ("⠐ my-session", true),                          // spinner: held
+            ("MINGW64:/c/Users/foo", false),                 // claude exits
+            ("MINGW64:/c/Users/foo", false),                 // stays off
+        ];
+        let mut active = false;
+        for &(title, expected) in steps {
+            active = next_claude_active(active, title);
+            assert_eq!(active, expected, "after title {:?}", title);
+        }
+    }
+
+    #[test]
+    fn test_title_is_shell_prompt_rejects_claude_and_session_names() {
+        // Claude titles must NOT be seen as shell (would break the OFF trigger)
+        assert!(!title_is_shell_prompt("claude"));
+        assert!(!title_is_shell_prompt("✳ Claude Code"));
+        assert!(!title_is_shell_prompt("claude · resume"));
+        // Session/topic names claude rewrites the title to — must be "held"
+        // (neither claude nor shell), so title_is_shell_prompt is false.
+        assert!(!title_is_shell_prompt("✳ ccmux-display-optimization"));
+        assert!(!title_is_shell_prompt("⠂ ccmux-display-optimization"));
+        // Empty title is not a shell prompt
+        assert!(!title_is_shell_prompt(""));
+    }
 
     #[test]
     fn test_detect_shell_returns_valid_path() {
