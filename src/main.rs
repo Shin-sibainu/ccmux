@@ -1,5 +1,6 @@
 mod app;
 mod claude_monitor;
+mod config;
 mod filetree;
 mod pane;
 mod preview;
@@ -71,6 +72,11 @@ fn main() -> Result<()> {
     // Create app
     let mut app = app::App::new(size.height, size.width)?;
     app.image_picker = image_picker;
+    // User config (fail-open: parse failures surface as a status
+    // message and the app continues with defaults).
+    let (config, config_warning) = config::Config::load();
+    app.config = config;
+    app.status_message = config_warning;
 
     // Main event loop
     let result = run_event_loop(&mut terminal, &mut app);

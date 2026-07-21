@@ -10,6 +10,8 @@ crossterm = "0.29"
 portable-pty = "0.8"
 vt100 = "0.16"
 anyhow = "1.0"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
 unicode-width = "0.2.1"
 arboard = "3.6"
 syntect = "5.3"

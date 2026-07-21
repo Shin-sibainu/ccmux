@@ -833,9 +833,15 @@ fn render_preview(app: &mut App, frame: &mut Frame, area: Rect) {
 fn render_status_bar(app: &App, frame: &mut Frame, area: Rect) {
     let focus = app.ws().focus_target;
 
+    // One-shot status message (external opener result / config warning)
+    // takes priority over hints; it is cleared on the next key input.
+    let hints = if let Some(msg) = &app.status_message {
+        Line::from(vec![
+            Span::styled(format!(" {}", msg), Style::default().fg(ACCENT_BLUE)),
+        ])
     // Rename mode overrides focus-specific hints — key input is being
     // captured by the buffer regardless of which pane/panel is focused.
-    let hints = if app.rename_input.is_some() {
+    } else if app.rename_input.is_some() {
         Line::from(vec![
             Span::styled(" Enter", Style::default().fg(ACCENT_BLUE)),
             Span::styled(" 決定  ", Style::default().fg(TEXT_DIM)),

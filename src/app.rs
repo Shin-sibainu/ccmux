@@ -445,6 +445,11 @@ pub struct App {
     clipboard: Option<arboard::Clipboard>,
     // Image preview protocol picker
     pub image_picker: Option<ratatui_image::picker::Picker>,
+    // User configuration (config.toml, loaded once at startup)
+    pub config: crate::config::Config,
+    /// One-shot status bar message (external opener result, config
+    /// warning). Cleared on the next key input.
+    pub status_message: Option<String>,
 }
 
 impl App {
@@ -489,6 +494,8 @@ impl App {
             claude_monitor: crate::claude_monitor::ClaudeMonitor::new(),
             clipboard: None,
             image_picker: None,
+            config: crate::config::Config::default(),
+            status_message: None,
         })
     }
 
@@ -615,6 +622,9 @@ impl App {
     // ─── Key handling ─────────────────────────────────────
 
     pub fn handle_key_event(&mut self, key: KeyEvent) -> Result<bool> {
+        // One-shot status message: any key input dismisses it.
+        self.status_message = None;
+
         // Rename mode — swallow all input until Enter/Esc.
         if self.rename_input.is_some() {
             return Ok(self.handle_rename_key(key));
@@ -836,6 +846,24 @@ impl App {
             KeyCode::Enter => {
                 let path = self.ws_mut().file_tree.toggle_or_select();
                 if let Some(path) = path {
+                    // 拡張子がオープナー設定にマッチしたら外部アプリで開く。
+                    // spawn 失敗時はステータスバーへ表示したうえで従来の
+                    // TUI プレビューにフォールバックする。
+                    if let Some(opener) = self.config.find_opener(&path).cloned() {
+                        match spawn_external_opener(&opener, &path) {
+                            Ok(()) => {
+                                self.status_message =
+                                    Some(format!("外部アプリで開きました: {}", opener.command));
+                                return Ok(true);
+                            }
+                            Err(e) => {
+                                self.status_message = Some(format!(
+                                    "外部起動失敗 ({}): {} — プレビューで開きます",
+                                    opener.command, e
+                                ));
+                            }
+                        }
+                    }
                     self.clear_selection_if_preview();
                     let boundary = self.ws().initial_cwd.clone();
                     let mut picker = self.image_picker.take();
@@ -1762,6 +1790,40 @@ impl App {
             ws.shutdown();
         }
     }
+}
+
+/// 設定されたオープナーで path を外部アプリ起動する。
+///
+/// TUI 巻き込み防止のため stdio はすべて null に落とし、Windows では
+/// CREATE_NO_WINDOW でコンソールウィンドウの生成も抑止する(.cmd シム
+/// 起動時の黒窓フラッシュ対策)。シェルは経由せず args を直接渡す
+/// (引数エスケープは std に委譲。Rust 1.77.2+ の .bat/.cmd 対策込み)。
+/// spawn 成功後は使い捨てスレッドで wait し、Unix でのゾンビ化を防ぐ。
+fn spawn_external_opener(
+    opener: &crate::config::Opener,
+    path: &std::path::Path,
+) -> std::io::Result<()> {
+    // canonicalize は Windows で \\?\ プレフィックスが付き外部アプリが
+    // 解釈できないことがあるため、FS を触らない absolute で正規化する。
+    let abs = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    let args = crate::config::build_args(opener, &abs.to_string_lossy());
+
+    let mut cmd = std::process::Command::new(&opener.command);
+    cmd.args(&args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let mut child = cmd.spawn()?;
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
 }
 
 /// Extract directory name from a path for tab title.
