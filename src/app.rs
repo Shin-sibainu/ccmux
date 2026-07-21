@@ -522,6 +522,33 @@ impl App {
         }
     }
 
+    /// ファイルツリーで選択されたファイルを開く共通経路(Enter キー・
+    /// マウスクリックの両方から呼ばれる)。拡張子がオープナー設定に
+    /// マッチしたら外部アプリで開き、未マッチ・spawn 失敗時は従来の
+    /// TUI プレビューにフォールバックする(失敗はステータスバー表示)。
+    fn open_selected_file(&mut self, path: PathBuf) {
+        if let Some(opener) = self.config.find_opener(&path).cloned() {
+            match spawn_external_opener(&opener, &path) {
+                Ok(()) => {
+                    self.status_message =
+                        Some(format!("外部アプリで開きました: {}", opener.command));
+                    return;
+                }
+                Err(e) => {
+                    self.status_message = Some(format!(
+                        "外部起動失敗 ({}): {} — プレビューで開きます",
+                        opener.command, e
+                    ));
+                }
+            }
+        }
+        self.clear_selection_if_preview();
+        let boundary = self.ws().initial_cwd.clone();
+        let mut picker = self.image_picker.take();
+        self.ws_mut().preview.load(&path, picker.as_mut(), Some(&boundary));
+        self.image_picker = picker;
+    }
+
     /// Recompute pane rectangles and apply sizes to every PTY in the
     /// active workspace. Returns `true` if any pane was actually
     /// resized (so callers can decide whether to enter the post-resize
@@ -846,29 +873,7 @@ impl App {
             KeyCode::Enter => {
                 let path = self.ws_mut().file_tree.toggle_or_select();
                 if let Some(path) = path {
-                    // 拡張子がオープナー設定にマッチしたら外部アプリで開く。
-                    // spawn 失敗時はステータスバーへ表示したうえで従来の
-                    // TUI プレビューにフォールバックする。
-                    if let Some(opener) = self.config.find_opener(&path).cloned() {
-                        match spawn_external_opener(&opener, &path) {
-                            Ok(()) => {
-                                self.status_message =
-                                    Some(format!("外部アプリで開きました: {}", opener.command));
-                                return Ok(true);
-                            }
-                            Err(e) => {
-                                self.status_message = Some(format!(
-                                    "外部起動失敗 ({}): {} — プレビューで開きます",
-                                    opener.command, e
-                                ));
-                            }
-                        }
-                    }
-                    self.clear_selection_if_preview();
-                    let boundary = self.ws().initial_cwd.clone();
-                    let mut picker = self.image_picker.take();
-                    self.ws_mut().preview.load(&path, picker.as_mut(), Some(&boundary));
-                    self.image_picker = picker;
+                    self.open_selected_file(path);
                 }
                 Ok(true)
             }
@@ -1326,11 +1331,7 @@ impl App {
                             self.ws_mut().file_tree.selected_index = entry_idx;
                             let path = self.ws_mut().file_tree.toggle_or_select();
                             if let Some(path) = path {
-                                self.clear_selection_if_preview();
-                                let boundary = self.ws().initial_cwd.clone();
-                                let mut picker = self.image_picker.take();
-                                self.ws_mut().preview.load(&path, picker.as_mut(), Some(&boundary));
-                                self.image_picker = picker;
+                                self.open_selected_file(path);
                             }
                         }
                         return;
