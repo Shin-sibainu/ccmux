@@ -57,6 +57,15 @@ pub fn encode_wheel_event(up: bool, col_in_pane: u16, row_in_pane: u16, mouse_ca
     }
 }
 
+/// Convert a screen position inside a pane's rect (border included) to the
+/// 0-based cell of the pane's content, which starts one cell inside the
+/// border.  Positions on the border are clamped to the nearest content cell.
+pub fn pane_content_cell(rect: Rect, col: u16, row: u16) -> (u16, u16) {
+    let c = col.saturating_sub(rect.x + 1).min(rect.width.saturating_sub(3));
+    let r = row.saturating_sub(rect.y + 1).min(rect.height.saturating_sub(3));
+    (c, r)
+}
+
 /// Events dispatched within the app.
 pub enum AppEvent {
     /// PTY output received for a pane.
@@ -1565,8 +1574,8 @@ impl App {
                             .map(|p| (p.is_alternate_screen(), p.is_mouse_capture_enabled()))
                             .unwrap_or((false, false));
                         if altbuf {
-                            let bytes =
-                                encode_wheel_event(true, col - rect.x, row - rect.y, mouse_cap);
+                            let (c, r) = pane_content_cell(rect, col, row);
+                            let bytes = encode_wheel_event(true, c, r, mouse_cap);
                             if let Some(pane) = self.ws_mut().panes.get_mut(&pane_id) {
                                 let _ = pane.write_input(&bytes);
                             }
@@ -1609,8 +1618,8 @@ impl App {
                             .map(|p| (p.is_alternate_screen(), p.is_mouse_capture_enabled()))
                             .unwrap_or((false, false));
                         if altbuf {
-                            let bytes =
-                                encode_wheel_event(false, col - rect.x, row - rect.y, mouse_cap);
+                            let (c, r) = pane_content_cell(rect, col, row);
+                            let bytes = encode_wheel_event(false, c, r, mouse_cap);
                             if let Some(pane) = self.ws_mut().panes.get_mut(&pane_id) {
                                 let _ = pane.write_input(&bytes);
                             }
@@ -1908,6 +1917,26 @@ fn key_event_to_bytes(key: &KeyEvent) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_pane_content_cell() {
+        // Pane at (10, 5), 20x8: content is 18x6 starting at (11, 6).
+        let rect = Rect::new(10, 5, 20, 8);
+        assert_eq!(pane_content_cell(rect, 11, 6), (0, 0));
+        assert_eq!(pane_content_cell(rect, 15, 8), (4, 2));
+        // The last content cell; the scrollbar column is still content.
+        assert_eq!(pane_content_cell(rect, 28, 11), (17, 5));
+        // The border clamps to the nearest content cell.
+        assert_eq!(pane_content_cell(rect, 10, 5), (0, 0));
+        assert_eq!(pane_content_cell(rect, 29, 12), (17, 5));
+    }
+
+    #[test]
+    fn test_wheel_uses_content_cell() {
+        // Wheel at the first content cell reports SGR (1, 1).
+        let (c, r) = pane_content_cell(Rect::new(0, 0, 10, 10), 1, 1);
+        assert_eq!(encode_wheel_event(true, c, r, true), b"\x1b[<64;1;1M".to_vec());
+    }
 
     #[test]
     fn test_layout_single_pane() {
