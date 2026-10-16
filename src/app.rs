@@ -57,6 +57,51 @@ pub fn encode_wheel_event(up: bool, col_in_pane: u16, row_in_pane: u16, mouse_ca
     }
 }
 
+/// Encode a left-button press or release for forwarding to a PTY
+/// application that has enabled mouse reporting.  Coordinates are 0-based
+/// cells inside the pane's content area.  Returns an empty vec when the
+/// application would not receive this event (reporting off, release in
+/// X10 press-only mode, or a cell the legacy encoding cannot express).
+pub fn encode_click_event(
+    press: bool,
+    col_in_pane: u16,
+    row_in_pane: u16,
+    mode: vt100::MouseProtocolMode,
+    encoding: vt100::MouseProtocolEncoding,
+) -> Vec<u8> {
+    match mode {
+        vt100::MouseProtocolMode::None => return Vec::new(),
+        vt100::MouseProtocolMode::Press if !press => return Vec::new(),
+        _ => {}
+    }
+    // Coordinates are 1-based on the wire.
+    let x = col_in_pane as u32 + 1;
+    let y = row_in_pane as u32 + 1;
+    match encoding {
+        vt100::MouseProtocolEncoding::Sgr => {
+            format!("\x1b[<0;{};{}{}", x, y, if press { 'M' } else { 'm' }).into_bytes()
+        }
+        vt100::MouseProtocolEncoding::Default | vt100::MouseProtocolEncoding::Utf8 => {
+            // Legacy encoding: button 0 = left press, 3 = release, each value offset by 32.
+            let button: u32 = if press { 0 } else { 3 };
+            let mut out = b"\x1b[M".to_vec();
+            for v in [button + 32, x + 32, y + 32] {
+                if v < 128 {
+                    out.push(v as u8);
+                } else if encoding == vt100::MouseProtocolEncoding::Utf8 && v <= 2047 {
+                    let mut buf = [0u8; 4];
+                    out.extend_from_slice(char::from_u32(v).unwrap().encode_utf8(&mut buf).as_bytes());
+                } else if encoding == vt100::MouseProtocolEncoding::Default && v <= 255 {
+                    out.push(v as u8);
+                } else {
+                    return Vec::new();
+                }
+            }
+            out
+        }
+    }
+}
+
 /// Events dispatched within the app.
 pub enum AppEvent {
     /// PTY output received for a pane.
@@ -437,6 +482,11 @@ pub struct App {
     last_tab_click: Option<(usize, Instant)>,
     // Text selection
     pub selection: Option<TextSelection>,
+    /// Left click inside a pane whose application has mouse reporting on:
+    /// (pane id, column, row) in pane content cells.  Forwarded to the PTY
+    /// as a press/release pair on mouse-up, or dropped if the mouse is
+    /// dragged to another cell (a drag stays a ccmux text selection).
+    pending_click: Option<(usize, u16, u16)>,
     // Version check (background)
     pub version_info: crate::version_check::VersionInfo,
     // Claude Code JSONL monitoring
@@ -481,6 +531,7 @@ impl App {
             rename_input: None,
             last_tab_click: None,
             selection: None,
+            pending_click: None,
             version_info: {
                 let info = crate::version_check::VersionInfo::new();
                 crate::version_check::spawn_check(info.clone());
@@ -1208,6 +1259,9 @@ impl App {
 
                 // Clear previous selection on any click
                 self.selection = None;
+                // A press always starts afresh (a missed mouse-up must not
+                // forward a stale click later).
+                self.pending_click = None;
 
                 // Check tab bar clicks
                 for &(tab_idx, rect) in &self.last_tab_rects {
@@ -1328,12 +1382,27 @@ impl App {
                         self.ws_mut().focused_pane_id = pane_id;
                         self.ws_mut().focus_target = FocusTarget::Pane;
 
+                        // Apps that asked for mouse reports (on the alternate
+                        // screen, where no scrollbar is drawn) get the click.
+                        let wants_mouse = self
+                            .ws()
+                            .panes
+                            .get(&pane_id)
+                            .map(|p| p.is_alternate_screen() && p.is_mouse_capture_enabled())
+                            .unwrap_or(false);
+
                         // Check if clicking on scrollbar (rightmost column inside border)
                         let scrollbar_col = rect.x + rect.width - 2; // -1 border, -1 scrollbar
-                        if col >= scrollbar_col {
+                        if col >= scrollbar_col && !wants_mouse {
                             let inner = Rect::new(rect.x + 1, rect.y + 1, rect.width.saturating_sub(2), rect.height.saturating_sub(2));
                             self.scroll_pane_to_click(pane_id, row, &inner);
                             self.dragging = Some(DragTarget::Scrollbar(pane_id, inner));
+                        } else if wants_mouse
+                            && col > rect.x && col < rect.x + rect.width - 1
+                            && row > rect.y && row < rect.y + rect.height - 1
+                        {
+                            // Inside the content area: remember the click.
+                            self.pending_click = Some((pane_id, col - rect.x - 1, row - rect.y - 1));
                         }
                         return;
                     }
@@ -1342,6 +1411,26 @@ impl App {
             MouseEventKind::Drag(MouseButton::Left) => {
                 let col = mouse.column;
                 let row = mouse.row;
+
+                // Moving to another cell turns a pending click into a drag,
+                // which stays a ccmux text selection.
+                if let Some((pane_id, c, r)) = self.pending_click {
+                    let moved = self
+                        .ws()
+                        .last_pane_rects
+                        .iter()
+                        .find(|(id, _)| *id == pane_id)
+                        .map(|(_, rect)| {
+                            col <= rect.x || row <= rect.y
+                                || col - rect.x - 1 != c || row - rect.y - 1 != r
+                        })
+                        .unwrap_or(true);
+                    if moved {
+                        self.pending_click = None;
+                    } else {
+                        return;
+                    }
+                }
 
                 // Border drag takes priority
                 if let Some(ref target) = self.dragging.clone() {
@@ -1506,6 +1595,18 @@ impl App {
             }
             MouseEventKind::Up(MouseButton::Left) => {
                 self.dragging = None;
+
+                // A click that did not move: forward press + release.
+                if let Some((pane_id, c, r)) = self.pending_click.take() {
+                    if let Some(pane) = self.ws_mut().panes.get_mut(&pane_id) {
+                        let (mode, encoding) = pane.mouse_protocol();
+                        let mut bytes = encode_click_event(true, c, r, mode, encoding);
+                        bytes.extend(encode_click_event(false, c, r, mode, encoding));
+                        if !bytes.is_empty() {
+                            let _ = pane.write_input(&bytes);
+                        }
+                    }
+                }
 
                 // Copy selected text to clipboard
                 if let Some(sel) = self.selection.clone() {
@@ -1908,6 +2009,36 @@ fn key_event_to_bytes(key: &KeyEvent) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_encode_click_sgr() {
+        use vt100::{MouseProtocolEncoding as E, MouseProtocolMode as M};
+        // 0-based cell (4, 2) is (5, 3) on the wire; release ends with 'm'.
+        assert_eq!(encode_click_event(true, 4, 2, M::PressRelease, E::Sgr), b"\x1b[<0;5;3M".to_vec());
+        assert_eq!(encode_click_event(false, 4, 2, M::PressRelease, E::Sgr), b"\x1b[<0;5;3m".to_vec());
+        assert_eq!(encode_click_event(true, 300, 100, M::AnyMotion, E::Sgr), b"\x1b[<0;301;101M".to_vec());
+    }
+
+    #[test]
+    fn test_encode_click_legacy() {
+        use vt100::{MouseProtocolEncoding as E, MouseProtocolMode as M};
+        assert_eq!(encode_click_event(true, 4, 2, M::PressRelease, E::Default), vec![0x1b, b'[', b'M', 32, 37, 35]);
+        assert_eq!(encode_click_event(false, 4, 2, M::PressRelease, E::Default), vec![0x1b, b'[', b'M', 35, 37, 35]);
+        // Default encoding cannot express values above 255; UTF-8 encoding can.
+        assert!(encode_click_event(true, 230, 0, M::PressRelease, E::Default).is_empty());
+        let utf8 = encode_click_event(true, 230, 0, M::PressRelease, E::Utf8);
+        assert_eq!(&utf8[..4], &[0x1b, b'[', b'M', 32]);
+        assert_eq!(std::str::from_utf8(&utf8[4..]).unwrap().chars().map(|c| c as u32).collect::<Vec<_>>(), vec![263, 33]);
+    }
+
+    #[test]
+    fn test_encode_click_respects_mode() {
+        use vt100::{MouseProtocolEncoding as E, MouseProtocolMode as M};
+        assert!(encode_click_event(true, 0, 0, M::None, E::Sgr).is_empty());
+        // X10 mode reports presses only.
+        assert!(!encode_click_event(true, 0, 0, M::Press, E::Sgr).is_empty());
+        assert!(encode_click_event(false, 0, 0, M::Press, E::Sgr).is_empty());
+    }
 
     #[test]
     fn test_layout_single_pane() {

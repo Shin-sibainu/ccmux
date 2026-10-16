@@ -237,6 +237,14 @@ impl Pane {
         )
     }
 
+    /// The mouse reporting mode and encoding the PTY application asked for,
+    /// used to forward clicks in the format it expects.
+    pub fn mouse_protocol(&self) -> (vt100::MouseProtocolMode, vt100::MouseProtocolEncoding) {
+        let parser = self.parser.lock().unwrap_or_else(|e| e.into_inner());
+        let screen = parser.screen();
+        (screen.mouse_protocol_mode(), screen.mouse_protocol_encoding())
+    }
+
     /// Check if Claude Code is running in this pane (by window title).
     ///
     /// Claude Code sets its terminal title to "Claude Code" or
